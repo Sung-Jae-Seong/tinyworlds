@@ -1,20 +1,21 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 import math
-from einops import rearrange, repeat, reduce
-from models.st_transformer import STTransformer, PatchEmbedding
+from einops import rearrange
+from models.st_transformer import STTransformer
+from models.patch_embed import PatchEmbedding
 from models.fsq import FiniteScalarQuantizer
 
 NUM_LATENT_ACTIONS_BINS = 2
 
 class LatentActionsEncoder(nn.Module):
     def __init__(self, frame_size=(128, 128), patch_size=8, embed_dim=128, num_heads=8, 
-                 hidden_dim=256, num_blocks=4, action_dim=3):
+                 hidden_dim=256, num_blocks=4, action_dim=3, pos_encoding="sinusoidal", use_adaln_zero=False):
         super().__init__()
-        self.patch_embed = PatchEmbedding(frame_size, patch_size, embed_dim)
-        self.transformer = STTransformer(embed_dim, num_heads, hidden_dim, num_blocks, causal=True)
+        self.patch_embed = PatchEmbedding(frame_size, patch_size, embed_dim, pos_encoding)
+        self.transformer = STTransformer(embed_dim, num_heads, hidden_dim, num_blocks, causal=True,
+                                         pos_encoding=pos_encoding, grid_size=(frame_size[0] // patch_size, frame_size[1] // patch_size), use_adaln_zero=use_adaln_zero)
         
         # embeddings to discrete latent bottleneck actions
         self.action_head = nn.Sequential(
@@ -49,10 +50,12 @@ class LatentActionsEncoder(nn.Module):
 
 class LatentActionsDecoder(nn.Module):
     def __init__(self, frame_size=(128, 128), patch_size=8, embed_dim=128, num_heads=8,
-                 hidden_dim=256, num_blocks=4, conditioning_dim=3):
+                 hidden_dim=256, num_blocks=4, conditioning_dim=3, pos_encoding="sinusoidal", use_adaln_zero=False):
         super().__init__()
-        self.patch_embed = PatchEmbedding(frame_size, patch_size, embed_dim)
-        self.transformer = STTransformer(embed_dim, num_heads, hidden_dim, num_blocks, causal=True, conditioning_dim=conditioning_dim)
+        self.patch_embed = PatchEmbedding(frame_size, patch_size, embed_dim, pos_encoding)
+        self.transformer = STTransformer(embed_dim, num_heads, hidden_dim, num_blocks, causal=True,
+                                         conditioning_dim=conditioning_dim, pos_encoding=pos_encoding,
+                                         grid_size=(frame_size[0] // patch_size, frame_size[1] // patch_size), use_adaln_zero=use_adaln_zero)
 
         # embeddings to mixed frame output patches
         self.frame_head = nn.Sequential(
@@ -97,13 +100,13 @@ class LatentActionsDecoder(nn.Module):
 
 class LatentActionModel(nn.Module):
     def __init__(self, frame_size=(128, 128), n_actions=8, patch_size=8, embed_dim=128, 
-                 num_heads=8, hidden_dim=256, num_blocks=4):
+                 num_heads=8, hidden_dim=256, num_blocks=4, pos_encoding="sinusoidal", use_adaln_zero=False):
         super().__init__()
         assert n_actions >= 2 and n_actions & (n_actions - 1) == 0, "n_actions must be a power of 2"
         self.action_dim=int(math.log(n_actions, NUM_LATENT_ACTIONS_BINS))
-        self.encoder = LatentActionsEncoder(frame_size, patch_size, embed_dim, num_heads, hidden_dim, num_blocks, action_dim=self.action_dim)
+        self.encoder = LatentActionsEncoder(frame_size, patch_size, embed_dim, num_heads, hidden_dim, num_blocks, action_dim=self.action_dim, pos_encoding=pos_encoding, use_adaln_zero=use_adaln_zero)
         self.quantizer = FiniteScalarQuantizer(latent_dim=self.action_dim, num_bins=NUM_LATENT_ACTIONS_BINS)
-        self.decoder = LatentActionsDecoder(frame_size, patch_size, embed_dim, num_heads, hidden_dim, num_blocks, conditioning_dim=self.action_dim)
+        self.decoder = LatentActionsDecoder(frame_size, patch_size, embed_dim, num_heads, hidden_dim, num_blocks, conditioning_dim=self.action_dim, pos_encoding=pos_encoding, use_adaln_zero=use_adaln_zero)
         self.var_target = 0.01
         self.var_lambda = 100.0
 

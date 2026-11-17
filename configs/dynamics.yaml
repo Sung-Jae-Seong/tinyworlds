@@ -16,6 +16,7 @@ num_blocks: 8
 # Paths
 video_tokenizer_path:
 latent_actions_path:
+cached_tokens_path:
 
 # resume from checkpoint
 checkpoint:

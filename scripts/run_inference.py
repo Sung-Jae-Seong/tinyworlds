@@ -1,15 +1,10 @@
 import torch
 from utils.datasets import load_data_and_data_loaders
-import matplotlib.pyplot as plt
-import time
 import os
 import random
-import glob
-import re
-from utils.utils import load_videotokenizer_from_checkpoint, load_latent_actions_from_checkpoint, load_dynamics_from_checkpoint, find_latest_checkpoint
+from utils.utils import find_latest_checkpoint
 from utils.config import InferenceConfig, load_config
 from utils.inference_utils import load_models, visualize_inference, get_action_latent, create_action_quantizer
-from einops import repeat
 from typing import Optional
 
 
@@ -130,6 +125,7 @@ def main():
                 index_to_latents_fn=idx_to_latents,
                 conditioning=action_latent,
                 temperature=args.temperature,
+                schedule=args.maskgit_schedule,
             )
 
         # decode next video tokens to frames

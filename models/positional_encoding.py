@@ -1,7 +1,6 @@
 import torch
 from einops import rearrange, repeat
 
-# TODO: Try RoPE / AliBi
 def sincos_1d(L, D, device, dtype):
     # 1d sinusoidal position encoding where element j of ith patch embedding is encoded as:
     # PE[i, 2j]   = sin(i / 10000^(2j/D))  # even indices
@@ -58,3 +57,42 @@ def build_spatial_only_pe(frame_size, patch_size, embed_dim, device='cpu', dtype
 
     pe_spatial = rearrange(pe_spatial, 'hp wp e -> 1 (hp wp) e')  # [1, P, E]
     return pe_spatial  # [1, P, E]
+
+def rope_1d_cos_sin(length, dim, device, dtype):
+    positions = torch.arange(length, device=device, dtype=dtype)
+    frequencies = 10000 ** (-torch.arange(dim // 2, device=device, dtype=dtype) / (dim // 2))
+    angles = torch.outer(positions, frequencies).repeat(1, 2)
+    return angles.cos(), angles.sin()
+
+
+def rope_2d_cos_sin(height, width, dim, device, dtype):
+    half = dim // 2
+    cos_y, sin_y = rope_1d_cos_sin(height, half, device, dtype)
+    cos_x, sin_x = rope_1d_cos_sin(width, half, device, dtype)
+    cos = torch.cat([
+        cos_y[:, None].expand(height, width, half),
+        cos_x[None].expand(height, width, half),
+    ], dim=-1).reshape(height * width, dim)
+    sin = torch.cat([
+        sin_y[:, None].expand(height, width, half),
+        sin_x[None].expand(height, width, half),
+    ], dim=-1).reshape(height * width, dim)
+    return cos, sin
+
+
+def rotate_half(x):
+    a, b = x.chunk(2, dim=-1)
+    return torch.cat([-b, a], dim=-1)
+
+
+def apply_rope_1d(x, cos, sin):
+    return x * cos[None, None] + rotate_half(x) * sin[None, None]
+
+
+def apply_rope_2d(x, cos, sin):
+    half = x.shape[-1] // 2
+    y, z = x.chunk(2, dim=-1)
+    return torch.cat([
+        apply_rope_1d(y, cos[:, :half], sin[:, :half]),
+        apply_rope_1d(z, cos[:, half:], sin[:, half:]),
+    ], dim=-1)

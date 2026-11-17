@@ -65,6 +65,8 @@ def main():
         num_experts=args.num_experts,
         top_k_experts=args.top_k_experts,
         moe_aux_loss_coeff=args.moe_aux_loss_coeff,
+        pos_encoding=args.pos_encoding,
+        use_adaln_zero=args.use_adaln_zero,
     ).to(args.device)
     if args.checkpoint:
         dynamics_model, _ = load_dynamics_from_checkpoint(
@@ -115,7 +117,9 @@ def main():
         rank=dist_setup['device_mesh'].get_rank() if dist_setup['device_mesh'] is not None else 0,
         world_size=dist_setup['world_size'],
         **data_overrides,
+        cached_tokens_path=args.cached_tokens_path,
     )
+    using_cached_tokens = bool(args.cached_tokens_path)
     train_iter = iter(training_loader)
 
     for i in tqdm(range(0, args.n_updates), disable=not is_main):
@@ -133,15 +137,17 @@ def main():
                 train_iter = iter(training_loader)  # reset iterator when epoch ends
                 x = next(train_iter)
 
-            x = x.to(args.device, non_blocking=True)  # [batch_size, seq_len, channels, height, width]
-
-            # get video tokens for batch
-            video_tokens = video_tokenizer.tokenize(x) # [B, T, P]
-            video_latents = video_tokenizer.quantizer.get_latents_from_indices(video_tokens, dim=-1) # [B, T, P, L]
-            if args.use_actions:
-                quantized_actions = latent_action_model.encode(x)  # [B, T - 1, A]
+            if using_cached_tokens:
+                video_tokens, action_tokens = (t.to(args.device, non_blocking=True) for t in x)
+                video_tokens = video_tokens.long()
+                quantized_actions = (latent_action_model.quantizer.get_latents_from_indices(action_tokens)
+                                     if args.use_actions else None)
             else:
-                quantized_actions = None
+                x = x.to(args.device, non_blocking=True)
+                video_tokens = video_tokenizer.tokenize(x)
+                quantized_actions = latent_action_model.encode(x) if args.use_actions else None
+
+            video_latents = video_tokenizer.quantizer.get_latents_from_indices(video_tokens, dim=-1)
 
             # predict masked frame latents with dynamics model (masking in dynamics model)
             with train_ctx:
@@ -181,7 +187,8 @@ def main():
             pixel_mask = rearrange(mask_positions.bool(), 'b t (h w) -> b t h w', h=grid_size)
             pixel_mask = pixel_mask.repeat_interleave(args.patch_size, dim=-2)
             pixel_mask = pixel_mask.repeat_interleave(args.patch_size, dim=-1)
-            masked_frames = x * (~pixel_mask).unsqueeze(2)
+            reference_frames = video_tokenizer.decoder(video_latents[:16]) if using_cached_tokens else x[:16]
+            masked_frames = reference_frames * (~pixel_mask[:len(reference_frames)]).unsqueeze(2)
         
             ckpt_path = save_training_state(dynamics_model, optimizers[0], schedulers[0], vars(args), checkpoints_dir, prefix='dynamics', step=i)
             # save secondary optimizer/scheduler state when using split optimizers (Muon+AdamW)

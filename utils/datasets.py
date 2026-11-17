@@ -104,22 +104,44 @@ class VideoDataset(Dataset):
         return torch.stack([self.transform(frame) for frame in frames])
 
 
-def load_data_and_data_loaders(dataset, batch_size, num_frames=1, distributed=False,
-                               rank=0, world_size=1, fps=15, preload_ratio=1):
-    """Preserve the five-value return API used by existing TinyWorlds scripts."""
-    if dataset not in DATASETS:
-        raise ValueError(f"Unknown dataset {dataset!r}; expected one of {list(DATASETS)}")
-    spec = DATASETS[dataset]
-    data_dir = Path.cwd() / "data"
-    options = dict(video_path=data_dir / spec["video"],
-                   cache_path=data_dir / spec["cache"], num_frames=num_frames,
-                   fps=30 if dataset == "PICODOOM" else fps, size=spec["size"],
-                   start=spec["start"], read_step=spec["read_step"],
-                   video_slice=spec.get("video_slice"), preload_ratio=preload_ratio)
+class TokenizedVideoDataset(Dataset):
+    """Precomputed video [T, P] and action [T - 1] tokens."""
 
-    # As in the upstream project, split=False gives the same data to train/val.
-    train_data = VideoDataset(**options, train=True, split=False)
-    val_data = VideoDataset(**options, train=False, split=False)
+    def __init__(self, path, num_frames):
+        with h5py.File(path, 'r') as f:
+            self.tokens = torch.from_numpy(f['tokens'][:])
+            self.actions = torch.from_numpy(f['actions'][:])
+        if self.tokens.shape[1] != num_frames:
+            raise ValueError('Cached context_length does not match training config')
+
+    def __len__(self):
+        return len(self.tokens)
+
+    def __getitem__(self, index):
+        return self.tokens[index], self.actions[index]
+
+
+def load_data_and_data_loaders(dataset, batch_size, num_frames=1, distributed=False,
+                               rank=0, world_size=1, fps=15, preload_ratio=1, cached_tokens_path=None):
+    """Preserve the five-value return API used by existing TinyWorlds scripts."""
+    if cached_tokens_path:
+        train_data = val_data = TokenizedVideoDataset(cached_tokens_path, num_frames)
+        variance = None
+    else:
+        if dataset not in DATASETS:
+            raise ValueError(f"Unknown dataset {dataset!r}; expected one of {list(DATASETS)}")
+        spec = DATASETS[dataset]
+        data_dir = Path.cwd() / "data"
+        options = dict(video_path=data_dir / spec["video"],
+                       cache_path=data_dir / spec["cache"], num_frames=num_frames,
+                       fps=30 if dataset == "PICODOOM" else fps, size=spec["size"],
+                       start=spec["start"], read_step=spec["read_step"],
+                       video_slice=spec.get("video_slice"), preload_ratio=preload_ratio)
+
+        # As in the upstream project, split=False gives the same data to train/val.
+        train_data = VideoDataset(**options, train=True, split=False)
+        val_data = VideoDataset(**options, train=False, split=False)
+        variance = np.var(train_data.data)
 
     def loader(data, shuffle):
         sampler = DistributedSampler(data, num_replicas=world_size, rank=rank,
@@ -131,7 +153,7 @@ def load_data_and_data_loaders(dataset, batch_size, num_frames=1, distributed=Fa
 
     train_loader = loader(train_data, shuffle=True)
     val_loader = loader(val_data, shuffle=True)
-    return train_data, val_data, train_loader, val_loader, np.var(train_data.data)
+    return train_data, val_data, train_loader, val_loader, variance
 
 
 def visualize_reconstruction(original, reconstruction, save_path=None):

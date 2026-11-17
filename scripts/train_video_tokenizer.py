@@ -53,6 +53,8 @@ def main():
         num_blocks=args.num_blocks,
         latent_dim=args.latent_dim,
         num_bins=args.num_bins,
+        pos_encoding=args.pos_encoding,
+        use_adaln_zero=args.use_adaln_zero,
     ).to(args.device)
     if args.checkpoint:
         model, _ = load_videotokenizer_from_checkpoint(

@@ -7,11 +7,13 @@ from einops import repeat
 
 class DynamicsModel(nn.Module):
     def __init__(self, frame_size=(128, 128), patch_size=4, embed_dim=128, num_heads=8,
-                 hidden_dim=128, num_blocks=4, num_bins=4, n_actions=8, conditioning_dim=3, latent_dim=5,
-                 use_moe=False, num_experts=4, top_k_experts=2, moe_aux_loss_coeff=0.01):
+                 hidden_dim=128, num_blocks=4, num_bins=4, conditioning_dim=3, latent_dim=5,
+                 use_moe=False, num_experts=4, top_k_experts=2, moe_aux_loss_coeff=0.01,
+                 pos_encoding="sinusoidal", use_adaln_zero=False):
         super().__init__()
         H, W = frame_size
         codebook_size = num_bins**latent_dim
+        self.pos_encoding = pos_encoding
 
         self.latent_embed = nn.Linear(latent_dim, embed_dim)
         self.transformer = STTransformer(
@@ -19,6 +21,8 @@ class DynamicsModel(nn.Module):
             conditioning_dim=conditioning_dim,
             use_moe=use_moe, num_experts=num_experts,
             top_k_experts=top_k_experts, moe_aux_loss_coeff=moe_aux_loss_coeff,
+            pos_encoding=pos_encoding, grid_size=(H // patch_size, W // patch_size),
+            use_adaln_zero=use_adaln_zero,
         )
         self.output_mlp = nn.Linear(embed_dim, codebook_size)
 
@@ -60,7 +64,8 @@ class DynamicsModel(nn.Module):
 
         # add spatial PE (affects only first 2/3 of dimensions)
         # STTransformer adds temporal PE to last 1/3 of dimensions
-        embeddings = embeddings + self.pos_spatial_dec.to(embeddings.device, embeddings.dtype)
+        if self.pos_encoding == "sinusoidal":
+            embeddings = embeddings + self.pos_spatial_dec.to(embeddings.device, embeddings.dtype)
         transformed = self.transformer(embeddings, conditioning=conditioning)  # [B, T, P, E]
 
         # transform to logits for each token in codebook
@@ -86,8 +91,12 @@ class DynamicsModel(nn.Module):
             return P_total * x
         return P_total * math.expm1(k * x) / math.expm1(k)
 
+    def cosine_schedule(self, t, T, P_total):
+        x = (t + 1) / T
+        return P_total * (1 - math.cos(math.pi * x / 2))
+
     @torch.no_grad()
-    def forward_inference(self, context_latents, prediction_horizon, num_steps, index_to_latents_fn, conditioning=None, schedule_k=5.0, temperature: float = 0.0):
+    def forward_inference(self, context_latents, prediction_horizon, num_steps, index_to_latents_fn, conditioning=None, schedule_k=5.0, temperature: float = 0.0, schedule="exp"):
         B, T_ctx, P, _ = context_latents.shape
         H = int(prediction_horizon)
         total = H * P
@@ -110,7 +119,10 @@ class DynamicsModel(nn.Module):
             mask[b, h, p] = False
 
         for step in range(num_steps):
-            target = math.ceil(self.exp_schedule(step, num_steps, total, schedule_k))
+            if schedule == "cosine":
+                target = math.ceil(self.cosine_schedule(step, num_steps, total))
+            else:
+                target = math.ceil(self.exp_schedule(step, num_steps, total, schedule_k))
             probs = predict_probs()
             confidence = probs.max(dim=-1).values[:, -H:, :]
 

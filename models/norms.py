@@ -70,3 +70,45 @@ class AdaptiveNormalizer(nn.Module):
         assert beta.shape[1] == x.shape[1], f"beta shape: {beta.shape} != x shape: {x.shape}"
         x = x * (1 + gamma) + beta # [B, T, P, E]
         return x
+
+
+class FiLMResidualNorm(AdaptiveNormalizer):
+    """Keep the legacy post-norm path without changing its parameters."""
+
+    def pre(self, x, conditioning=None):
+        return x, None
+
+    def post(self, x, update, gate, conditioning=None):
+        return self(x + update, conditioning)
+
+
+class AdaLNZeroNorm(nn.Module):
+    """Pre-normalization with zero-initialized scale, shift, and residual gate."""
+
+    def __init__(self, embed_dim, conditioning_dim=None):
+        super().__init__()
+        self.norm = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
+        self.to_params = None
+        if conditioning_dim is not None:
+            self.to_params = nn.Sequential(nn.SiLU(), nn.Linear(conditioning_dim, 3 * embed_dim))
+            nn.init.zeros_(self.to_params[-1].weight)
+            nn.init.zeros_(self.to_params[-1].bias)
+
+    def forward(self, x, conditioning=None):
+        x_norm = self.norm(x)
+        if self.to_params is None or conditioning is None:
+            return x_norm, None
+
+        scale, shift, gate = self.to_params(conditioning).chunk(3, dim=-1)
+        if scale.shape[1] == x.shape[1] - 1:
+            scale, shift, gate = [
+                torch.cat([torch.zeros_like(t[:, :1]), t], dim=1)
+                for t in (scale, shift, gate)
+            ]
+        return x_norm * (1 + scale[:, :, None]) + shift[:, :, None], gate[:, :, None]
+
+    def pre(self, x, conditioning=None):
+        return self(x, conditioning)
+
+    def post(self, x, update, gate, conditioning=None):
+        return x + (gate * update if gate is not None else update)

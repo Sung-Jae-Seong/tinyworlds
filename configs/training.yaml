@@ -12,6 +12,8 @@ context_length: 4
 frame_size: 64
 latent_dim: 5 # for video tokenizer
 num_bins: 4 # for video tokenizer
+pos_encoding: sinusoidal # sinusoidal or rope
+use_adaln_zero: false # false: FiLM / RMSNorm, true: AdaLN-Zero
 n_actions: 4
 
 # performance

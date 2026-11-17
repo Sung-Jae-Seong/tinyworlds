@@ -53,6 +53,8 @@ def main():
         hidden_dim=args.hidden_dim,
         num_blocks=args.num_blocks,
         n_actions=args.n_actions,
+        pos_encoding=args.pos_encoding,
+        use_adaln_zero=args.use_adaln_zero,
     ).to(args.device)
     if args.checkpoint:
         model, _ = load_latent_actions_from_checkpoint(

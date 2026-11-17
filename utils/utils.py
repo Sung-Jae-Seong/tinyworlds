@@ -174,6 +174,8 @@ def load_videotokenizer_from_checkpoint(checkpoint_path, device, model = None, i
         'num_blocks': cfg.get('num_blocks', 4),
         'latent_dim': cfg.get('latent_dim', 6),
         'num_bins': cfg.get('num_bins', 4),
+        'pos_encoding': cfg.get('pos_encoding', 'sinusoidal'),
+        'use_adaln_zero': cfg.get('use_adaln_zero', False),
     }
     if model is None:
         model = VideoTokenizer(**kwargs)
@@ -204,6 +206,8 @@ def load_latent_actions_from_checkpoint(checkpoint_path, device, model = None, i
         'num_heads': cfg.get('num_heads', 8),
         'hidden_dim': cfg.get('hidden_dim', 256),
         'num_blocks': cfg.get('num_blocks', 4),
+        'pos_encoding': cfg.get('pos_encoding', 'sinusoidal'),
+        'use_adaln_zero': cfg.get('use_adaln_zero', False),
     }
     if model is None:
         model = LatentActionModel(**kwargs)
@@ -232,7 +236,7 @@ def load_dynamics_from_checkpoint(checkpoint_path, device, model = None, is_dist
         cond_inferred = None
         for k, v in model_sd.items():
             # Linear weight shape: [out_features, in_features]; in_features is conditioning dim
-            if k.endswith('to_gamma_beta.1.weight'):
+            if k.endswith(('to_gamma_beta.1.weight', 'to_params.1.weight')):
                 cond_inferred = int(v.shape[1])
                 break
         conditioning_dim = cond_inferred if cond_inferred is not None else 3
@@ -250,6 +254,8 @@ def load_dynamics_from_checkpoint(checkpoint_path, device, model = None, is_dist
         'num_experts': cfg.get('num_experts', 4),
         'top_k_experts': cfg.get('top_k_experts', 2),
         'moe_aux_loss_coeff': cfg.get('moe_aux_loss_coeff', 0.01),
+        'pos_encoding': cfg.get('pos_encoding', 'sinusoidal'),
+        'use_adaln_zero': cfg.get('use_adaln_zero', False),
     }
     if model is None:
         model = DynamicsModel(**kwargs)

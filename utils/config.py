@@ -108,6 +108,8 @@ class VideoTokenizerConfig:
 	wandb_project: str
 	# resume from checkpoint
 	checkpoint: Optional[str]
+	pos_encoding: str = "sinusoidal"
+	use_adaln_zero: bool = False
 	# Optimizer
 	optimizer: str = "adamw"
 	muon_momentum: float = 0.95
@@ -154,6 +156,8 @@ class LatentActionsConfig:
 	wandb_project: str
 	# resume from checkpoint
 	checkpoint: Optional[str]
+	pos_encoding: str = "sinusoidal"
+	use_adaln_zero: bool = False
 	# Optimizer
 	optimizer: str = "adamw"
 	muon_momentum: float = 0.95
@@ -212,6 +216,8 @@ class DynamicsConfig:
 	num_experts: int = 4
 	top_k_experts: int = 2
 	moe_aux_loss_coeff: float = 0.01
+	pos_encoding: str = "sinusoidal"
+	use_adaln_zero: bool = False
 	# Optimizer
 	optimizer: str = "adamw"
 	muon_momentum: float = 0.95
@@ -221,6 +227,7 @@ class DynamicsConfig:
 	# other params
 	fps: Optional[int] = None
 	preload_ratio: Optional[float] = None
+	cached_tokens_path: Optional[str] = None
 	
 	def __post_init__(self) -> None:
 		_validate_amp_fsdp(self.amp, self.distributed)
@@ -277,6 +284,8 @@ class TrainingConfig:
 	num_experts: int = 4
 	top_k_experts: int = 2
 	moe_aux_loss_coeff: float = 0.01
+	pos_encoding: str = "sinusoidal"
+	use_adaln_zero: bool = False
 	# Optimizer
 	optimizer: str = "adamw"
 	muon_momentum: float = 0.95
@@ -312,6 +321,7 @@ class InferenceConfig:
 	use_interactive_mode: bool
 	preload_ratio: Optional[float] = None
 	n_actions: int = 4
+	maskgit_schedule: str = "exp"
 
 
 def load_config(config_cls, default_config_path: Optional[str] = None):
