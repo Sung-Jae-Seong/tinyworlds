@@ -3,6 +3,7 @@ video_tokenizer_path:
 latent_actions_path: 
 dynamics_path: 
 use_latest_checkpoints: true
+n_actions: 16 # must match Dynamics training action dimension/codebook
 
 # inference params
 dataset: PONG

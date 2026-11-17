@@ -1,4 +1,3 @@
-from models.utils import ModelType
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -104,7 +103,3 @@ class VideoTokenizer(nn.Module):
         # decode quantized latents back to frames
         x_hat = self.decoder(quantized_z)  # [B, T, C, H, W]
         return x_hat
-
-    @property
-    def model_type(self) -> str:
-        return ModelType.VideoTokenizer

@@ -1,4 +1,3 @@
-from models.utils import ModelType
 import torch
 import torch.nn as nn
 import math
@@ -81,127 +80,69 @@ class DynamicsModel(nn.Module):
 
         return predicted_logits, mask_positions, loss  # logits, mask, optional loss
 
-    def exp_schedule_torch(self, t, T, P_total, k, device):
-        # t: current step, T: total steps, P_total: total masked positions across the horizon window
-        # exp schedule is P_total * (1 - exp(k * t / T)) / (1 - exp(k))
-        x = t / max(T, 1)
-        k_tensor = torch.tensor(k, device=device)
-        result = P_total * torch.expm1(k_tensor * x) / torch.expm1(k_tensor)
-        if t == T - 1:
-            return torch.tensor(P_total, dtype=result.dtype, device=device)
-        return result
+    def exp_schedule(self, t, T, P_total, k): # accumulated unmasked tokens scheduling. other:cosine
+        x = (t + 1) / T
+        if k == 0:
+            return P_total * x
+        return P_total * math.expm1(k * x) / math.expm1(k)
 
     @torch.no_grad()
     def forward_inference(self, context_latents, prediction_horizon, num_steps, index_to_latents_fn, conditioning=None, schedule_k=5.0, temperature: float = 0.0):
-        # MaskGIT-style iterative decoding across all prediction horizon steps
-        # context_latents: [B, T_ctx, P, L]
-        # T_ctx=context timesteps, H=prediction horizon, K=codebook size
-        device = context_latents.device
-        dtype = context_latents.dtype
-        B, T_ctx, P, L = context_latents.shape  # B, T_ctx, P, L
-        H = int(prediction_horizon)  # number of horizon steps to decode
+        B, T_ctx, P, _ = context_latents.shape
+        H = int(prediction_horizon)
+        total = H * P
+        use_sampling = bool(temperature and temperature > 0)
 
-        # append prediction_horizon masked frame latents to predict dynamics on
-        mask_latents = self.mask_token.to(device, dtype).expand(B, H, P, -1)  # [B, H, P, L]
-        input_latents = torch.cat([context_latents, mask_latents], dim=1)  # [B, T_ctx+H, P, L]
-        mask = torch.ones(B, H, P, 1, dtype=torch.bool, device=device)  # [B, H, P, 1]
+        input_latents = torch.cat([
+            context_latents,
+            self.mask_token.to(context_latents).expand(B, H, P, -1)
+        ], dim=1)
+        mask = torch.ones(B, H, P, dtype=torch.bool, device=context_latents.device)
 
-        P_total = H * P  # total masked positions across the horizon window
-        for m in range(num_steps):
-            n_tokens_raw = self.exp_schedule_torch(m, num_steps, P_total, schedule_k, device)
+        def predict_probs():
+            logits, _, _ = self.forward(input_latents, training=False, conditioning=conditioning, targets=None)
+            return torch.softmax(logits / float(temperature) if use_sampling else logits, dim=-1)
 
-            # predict logits for current input
-            logits, _, _ = self.forward(input_latents, training=False, conditioning=conditioning, targets=None)  # [B, T_ctx+H, P, L^D]
-            # temperature scaling
-            if temperature and temperature > 0:
-                scaled_logits = logits / float(temperature)
+        def fill(b, positions, indices):
+            h, p = positions // P, positions % P
+            token_ids = indices[b, T_ctx + h, p].reshape(1, 1, -1)
+            input_latents[b, T_ctx + h, p] = index_to_latents_fn(token_ids)[0, 0]
+            mask[b, h, p] = False
+
+        for step in range(num_steps):
+            target = math.ceil(self.exp_schedule(step, num_steps, total, schedule_k))
+            probs = predict_probs()
+            confidence = probs.max(dim=-1).values[:, -H:, :]
+
+            if use_sampling:
+                indices = torch.distributions.Categorical(
+                    probs=probs.reshape(-1, probs.shape[-1])
+                ).sample().view(probs.shape[:-1])
             else:
-                scaled_logits = logits
-            probs = torch.softmax(scaled_logits, dim=-1)  # [B, T_ctx+H, P, L^D]
-            # confidence for unmask selection always from max probability
-            max_probs, _ = torch.max(probs, dim=-1)  # [B, T_ctx+H, P]
-            # choose indices either via argmax (temperature==0) or sampling
-            if temperature and temperature > 0:
-                Bc, Tc, Pc, Ld = probs.shape  # Bc=B, Tc=T_ctx+H, Pc=P, Ld=L^D
-                sampled = torch.distributions.Categorical(probs=probs.reshape(-1, Ld)).sample()
-                predicted_indices = sampled.view(Bc, Tc, Pc)  # [B, T_ctx+H, P]
-            else:
-                _, predicted_indices = torch.max(probs, dim=-1)  # [B, T_ctx+H, P]
+                indices = probs.argmax(dim=-1)
 
-            horizon_probs = max_probs[:, -H:, :]  # [B, H, P]
-
-            # for each batch element, select tokens to unmask from all masked positions
             for b in range(B):
-                masked_mask_all = mask[b, :, :, 0]  # [H, P]
-                masked_flat = masked_mask_all.view(-1)  # [H*P]
-                masked_flat_idx = torch.where(masked_flat)[0]  # [num_masked]
-                if masked_flat_idx.numel() == 0:
+                positions = mask[b].flatten().nonzero(as_tuple=True)[0]
+                remaining = positions.numel()
+                if remaining == 0:
                     continue
 
-                # TODO: try to clean this
-                num_masked_b = int(masked_flat_idx.numel())
-                prev_b = P_total - num_masked_b
-                target_unmasked = int(torch.ceil(n_tokens_raw).item())
-                k_floor = max(P_total // 16, 1)
-                k_b = max(k_floor, min(max(target_unmasked - prev_b, 0), num_masked_b))
+                prev = total - remaining
+                k_floor = max(total // 16, 1)
+                k = max(k_floor, min(max(target - prev, 0), remaining))
+                if remaining > k:
+                    scores = confidence[b].contiguous().view(-1)[positions]
+                    positions = positions[scores.topk(k).indices]
+                fill(b, positions, indices)
 
-                pos_probs_flat = horizon_probs[b].contiguous().view(-1)[masked_flat_idx]  # [num_masked]
-                if pos_probs_flat.numel() > k_b:
-                    top_idx = torch.topk(pos_probs_flat, k_b, largest=True).indices
-                    sel_flat = masked_flat_idx[top_idx]
-                else:
-                    sel_flat = masked_flat_idx
-
-                # map back to (h, p)
-                h_sel = torch.div(sel_flat, P, rounding_mode='floor')  # [k_b]
-                p_sel = sel_flat % P  # [k_b]
-
-                # group by unique h and write sampled tokens to input tensor
-                if h_sel.numel() > 0:
-                    unique_h = torch.unique(h_sel, sorted=True)
-                    for uh in unique_h:
-                        mask_h = (h_sel == uh)
-                        p_list = p_sel[mask_h]
-                        if p_list.numel() == 0:
-                            continue
-                        t_abs = T_ctx + int(uh.item())  # absolute time index in [T_ctx, T_ctx+H-1] (for current horizon step)
-                        idx_sel = predicted_indices[b:b+1, t_abs:t_abs+1, p_list]  # [1,1,P_sel]
-                        pred_latents_sel = index_to_latents_fn(idx_sel)  # [1,1,P_sel,L]
-                        input_latents[b:b+1, t_abs:t_abs+1, p_list] = pred_latents_sel
-                        mask[b, int(uh.item()), p_list, 0] = False
-
-            # early exit if all horizon tokens are unmasked
-            if not mask[:, :, :, 0].any():  # mask: [B,H,P,1]
+            if not mask.any():
                 break
 
-        # final completion: fill any remaining masked tokens across all horizon steps via argmax
-        # TODO: try removing
-        if mask[:, :, :, 0].any():
-            logits, _, _ = self.forward(input_latents, training=False, conditioning=conditioning, targets=None)  # [B, T_ctx+H, P, L^D]
-            if temperature and temperature > 0:
-                scaled_logits = logits / float(temperature)
-            else:
-                scaled_logits = logits
-            probs = torch.softmax(scaled_logits, dim=-1)  # [B, T_ctx+H, P, L^D]
-            _, predicted_indices = torch.max(probs, dim=-1)  # [B, T_ctx+H, P]
+        if mask.any():  # num_steps <= 0 또는 예외적인 잔여 마스크
+            indices = predict_probs().argmax(dim=-1)
             for b in range(B):
-                h_idx, p_idx = torch.where(mask[b, :, :, 0])  # both [N_remaining]
-                if h_idx.numel() == 0:
-                    continue
-                unique_h = torch.unique(h_idx, sorted=True)
-                for uh in unique_h:
-                    mask_h = (h_idx == uh)
-                    p_list = p_idx[mask_h]
-                    if p_list.numel() == 0:
-                        continue
-                    t_abs = T_ctx + int(uh.item())  # absolute time index
-                    idx_sel = predicted_indices[b:b+1, t_abs:t_abs+1, p_list]  # [1,1,P_sel]
-                    pred_latents_sel = index_to_latents_fn(idx_sel)  # [1,1,P_sel,L]
-                    input_latents[b:b+1, t_abs:t_abs+1, p_list] = pred_latents_sel
-                    mask[b, int(uh.item()), p_list, 0] = False
+                positions = mask[b].flatten().nonzero(as_tuple=True)[0]
+                if positions.numel():
+                    fill(b, positions, indices)
 
-        return input_latents # [B, T_ctx + H, P, L]
-
-    @property
-    def model_type(self) -> str:
-        return ModelType.DynamicsModel
+        return input_latents

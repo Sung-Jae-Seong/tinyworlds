@@ -40,10 +40,6 @@ class FiniteScalarQuantizer(nn.Module):
 
         return quantized_z
 
-    def get_codebook_usage(self, quantized_z):
-        unique_bins = torch.unique(quantized_z).shape[0]
-        return unique_bins / self.num_bins
-
     def get_indices_from_latents(self, latents, dim=-1):
         # to get fsq indices, for each dimension, we get the index and add it (so multiply by L then sum)
         # for each dimension of each latent, get sum of (value * L^current_dim) along latent dim which is the index of that latent in the codebook

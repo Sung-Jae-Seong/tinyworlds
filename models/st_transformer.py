@@ -72,18 +72,7 @@ class TemporalAttention(nn.Module):
         k = rearrange(self.k_proj(x), 'b t p (h d) -> (b p) h t d', h=self.num_heads)
         v = rearrange(self.v_proj(x), 'b t p (h d) -> (b p) h t d', h=self.num_heads) # [B, P, H, T, D]
 
-        k_t = k.transpose(-2, -1) # [(B*P), H, T, D, T]
-
-        # attention(q, k, v) = softmax(qk^T / sqrt(d)) v
-        scores = torch.matmul(q, k_t) / math.sqrt(self.head_dim) # [(B*P), H, T, T]
-
-        # causal mask for each token t in seq, mask out all tokens to the right of t (after t)
-        if self.causal:
-            mask = torch.triu(torch.ones(T, T), diagonal=1).bool().to(x.device)
-            scores = scores.masked_fill(mask, -torch.inf) # [(B*P), H, T, T]
-
-        attn_weights = F.softmax(scores, dim=-1) # [(B*P), H, T, T]
-        attn_output = torch.matmul(attn_weights, v) # [(B*P), H, T, D]
+        attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal) # [(B*P), H, T, D]
         attn_output = rearrange(attn_output, '(b p) h t d -> b t p (h d)', b=B, p=P) # [B, T, P, E]
 
         # out proj to mix head information

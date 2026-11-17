@@ -24,122 +24,71 @@ def readable_timestamp():
     return time.strftime("%Y_%m_%d_%H_%M_%S")
 
 def find_latest_checkpoint(base_dir, model_name, run_root_dir: Optional[str] = None, stage_name: Optional[str] = None):
-    """Find latest checkpoint.
-    If run_root_dir (and optional stage_name) are provided, search only under
-    <run_root_dir>/<stage_name>/checkpoints (or <run_root_dir>/**/checkpoints if stage_name None).
-    Otherwise, fall back to project-wide model type-based search.
-    Newest run dir first, then highest step within it.
-    If the newest run root has none for this model, keep searching older runs.
+    """Select the highest-step checkpoint in the newest matching stage directory.
+
+    Prefer the requested run root when it has matches; otherwise search results/.
     """
-    def collect_checkpoint_paths(roots, model_name):
-        alias_map = {
+    aliases = {
+        'video_tokenizer': ['video_tokenizer'],
+        'latent_actions': ['latent_actions', 'lam', 'actions', 'action_tokenizer'],
+        'dynamics': ['dynamics'],
+    }.get(model_name, [model_name])
+
+    def collect(roots):
+        found = set()
+        for root in roots:
+            for alias in aliases:
+                for pattern in (f"*{alias}_step_*", f"*{alias}_checkpoint_*"):
+                    for path in glob.glob(os.path.join(root, '**', pattern), recursive=True):
+                        path = os.path.normpath(path)
+                        if os.path.isdir(path):
+                            valid = any(os.path.isfile(os.path.join(path, f)) for f in (STATE, MODEL_CHECKPOINT))
+                        else:
+                            valid = os.path.splitext(path)[1] in ('.pt', '.pth')
+                        if valid:
+                            found.add(path)
+        return list(found)
+
+    def project_matches():
+        base = os.path.join(base_dir, 'results', '**')
+        stage_dirs = {
             'video_tokenizer': ['video_tokenizer'],
             'latent_actions': ['latent_actions', 'lam', 'actions', 'action_tokenizer'],
             'dynamics': ['dynamics'],
-        }
-        aliases = alias_map.get(model_name, [model_name])
-        candidates = []
-        seen = set()
-
-        def add_candidate(path: str) -> None:
-            norm = os.path.normpath(path)
-            if norm in seen:
-                return
-            if os.path.isdir(norm):
-                # require at least state or model file
-                state_file = os.path.join(norm, STATE)
-                model_file = os.path.join(norm, MODEL_CHECKPOINT)
-                if os.path.isfile(state_file) or os.path.isfile(model_file):
-                    candidates.append(norm)
-                    seen.add(norm)
-            else:
-                _, ext = os.path.splitext(norm)
-                if ext in ('.pt', '.pth'):
-                    candidates.append(norm)
-                    seen.add(norm)
-
-        patterns = []
-        for alias in aliases:
-            patterns.append(f"*{alias}_step_*")
-            patterns.append(f"*{alias}_checkpoint_*")
-
-        for root in roots:
-            for pat in patterns:
-                search_pattern = os.path.join(root, "**", pat)
-                for match in glob.glob(search_pattern, recursive=True):
-                    add_candidate(match)
-        return candidates
-
-    def run_dir_of(path: str) -> str:
-        # Walk up until we reach the 'checkpoints' directory, then return its parent (the stage dir)
-        d = path if os.path.isdir(path) else os.path.dirname(path)
-        while d and os.path.basename(d) != 'checkpoints':
-            parent = os.path.dirname(d)
-            if parent == d:
-                break
-            d = parent
-        # If we found 'checkpoints', return its parent; otherwise, fallback to two-level up
-        if d and os.path.basename(d) == 'checkpoints':
-            return os.path.dirname(d)
-        # Fallback: use the directory containing the checkpoint path (or its parent)
-        candidate_dir = path if os.path.isdir(path) else os.path.dirname(path)
-        return candidate_dir
-
-    def project_wide_search():
-        # Fallback to model_type/results search in repository
-        # Allow multiple possible directory names per model
-        model_type_dirs = {
-            'video_tokenizer': ['video_tokenizer'],
-            'latent_actions': ['latent_actions', 'lam', 'actions', 'action_tokenizer'],
-            'dynamics': ['dynamics',],
-        }
-        dirs = model_type_dirs.get(model_name)
-        if not dirs:
-            roots = [os.path.join(base_dir, 'results', '**', 'checkpoints')]
-        else:
-            roots = [os.path.join(base_dir, 'results', '**', d, 'checkpoints') for d in dirs]
-        files = collect_checkpoint_paths(roots, model_name)
-        if not files:
-            # Generic fallback: search all checkpoints regardless of stage dir name
-            generic_roots = [os.path.join(base_dir, 'results', '**', 'checkpoints')]
-            files = collect_checkpoint_paths(generic_roots, model_name)
-        if not files:
-            raise Exception(f"No checkpoint files found for {model_name}")
-        run_dir_to_files = {}
-        for p in files:
-            rd = run_dir_of(p)
-            run_dir_to_files.setdefault(rd, []).append(p)
-        newest_run_dir = max(run_dir_to_files.keys(), key=lambda d: os.path.getctime(d))
-        candidate_files = run_dir_to_files[newest_run_dir]
-        return candidate_files
+        }.get(model_name)
+        roots = ([os.path.join(base, stage, 'checkpoints') for stage in stage_dirs]
+                 if stage_dirs else [os.path.join(base, 'checkpoints')])
+        return collect(roots) or collect([os.path.join(base, 'checkpoints')])
 
     if run_root_dir is not None:
-        if stage_name:
-            roots = [os.path.join(run_root_dir, stage_name, 'checkpoints')]
-        else:
-            roots = [os.path.join(run_root_dir, '**', 'checkpoints')]
-        files = collect_checkpoint_paths(roots, model_name)
-        if not files:
-            # Fallback: search project-wide older runs until found
-            candidate_files = project_wide_search()
-        else:
-            # Group by run dir within the provided root and choose newest run dir
-            run_dir_to_files = {}
-            for p in files:
-                rd = run_dir_of(p)
-                run_dir_to_files.setdefault(rd, []).append(p)
-            newest_run_dir = max(run_dir_to_files.keys(), key=lambda d: os.path.getctime(d))
-            candidate_files = run_dir_to_files[newest_run_dir]
+        root = os.path.join(run_root_dir, stage_name, 'checkpoints') if stage_name else os.path.join(run_root_dir, '**', 'checkpoints')
+        files = collect([root]) or project_matches()
     else:
-        candidate_files = project_wide_search()
+        files = project_matches()
 
-    def extract_step(path: str) -> int:
-        fname = os.path.basename(path)
-        m = re.search(r"_step_(\d+)", fname)
-        return int(m.group(1)) if m else -1
+    if not files:
+        raise Exception(f"No checkpoint files found for {model_name}")
 
-    candidate_files.sort(key=lambda p: (extract_step(p), os.path.getctime(p)))
-    return candidate_files[-1]
+    def run_dir(path):
+        directory = path if os.path.isdir(path) else os.path.dirname(path)
+        current = directory
+        while current and os.path.basename(current) != 'checkpoints':
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        return os.path.dirname(current) if os.path.basename(current) == 'checkpoints' else directory
+
+    groups = {}
+    for path in files:
+        groups.setdefault(run_dir(path), []).append(path)
+    newest = max(groups, key=os.path.getctime)
+
+    def order(path):
+        match = re.search(r"_step_(\d+)", os.path.basename(path))
+        return (int(match.group(1)) if match else -1, os.path.getctime(path))
+
+    return max(groups[newest], key=order)
 
 def run_command(cmd, description):
     # empirical max dataLoader throughput settings (I used 1-6 H100s)
@@ -151,18 +100,16 @@ def run_command(cmd, description):
     env.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
 
     try:
-        result = subprocess.run(cmd, check=True, capture_output=False, env=env)
+        subprocess.run(cmd, check=True, env=env)
         return True
     except subprocess.CalledProcessError as e:
-        print(f"Error: {e.stderr}")
+        print(f"Command failed with exit code {e.returncode}")
         return False
     except KeyboardInterrupt:
         return False
 
 def save_training_state(model, optimizer, scheduler, config, checkpoints_dir, prefix, step):
-    """Save a checkpoint with model/optimizer/scheduler and the exact config.
-    The filename includes the global step and a timestamp for uniqueness.
-    """
+    """Save model, optimizer, scheduler metadata, and config under a step directory."""
     import torch
     ts = readable_timestamp()
     if isinstance(model, (FSDPModule, DDP)):
@@ -200,12 +147,22 @@ def save_training_state(model, optimizer, scheduler, config, checkpoints_dir, pr
     return ckpt_path
 
 
+def _read_checkpoint(checkpoint_path):
+    import torch
+    ckpt = Path(checkpoint_path)
+    model_sd = torch.load(ckpt if ckpt.is_file() else ckpt / MODEL_CHECKPOINT, map_location='cpu', weights_only=True)
+    state = torch.load(ckpt / STATE, map_location='cpu', weights_only=False) if ckpt.is_dir() else {'config': {}}
+    if ckpt.is_file() and 'model' in model_sd:
+        state = {k: v for k, v in model_sd.items() if k != 'model'}
+        model_sd = model_sd['model']
+    return model_sd, state
+
+
 def load_videotokenizer_from_checkpoint(checkpoint_path, device, model = None, is_distributed = False):
     """Instantiate VideoTokenizer from a checkpoint's saved config and load weights."""
     import torch
     from models.video_tokenizer import VideoTokenizer
-    model_sd = torch.load(Path(checkpoint_path) / MODEL_CHECKPOINT, map_location='cpu', weights_only=True)
-    state_cfg = torch.load(Path(checkpoint_path) / STATE, map_location='cpu', weights_only=False)
+    model_sd, state_cfg = _read_checkpoint(checkpoint_path)
     cfg = state_cfg.get('config', {}) or {}
     frame_size = cfg.get('frame_size', 128)
     kwargs = {
@@ -236,8 +193,7 @@ def load_latent_actions_from_checkpoint(checkpoint_path, device, model = None, i
     """Instantiate LatentActionModel from a checkpoint's saved config and load weights."""
     import torch
     from models.latent_actions import LatentActionModel
-    model_sd = torch.load(Path(checkpoint_path) / MODEL_CHECKPOINT, map_location='cpu', weights_only=True)
-    state_cfg = torch.load(Path(checkpoint_path) / STATE, map_location='cpu', weights_only=False)
+    model_sd, state_cfg = _read_checkpoint(checkpoint_path)
     cfg = state_cfg.get('config', {}) or {}
     frame_size = cfg.get('frame_size', 128)
     kwargs = {
@@ -267,8 +223,7 @@ def load_dynamics_from_checkpoint(checkpoint_path, device, model = None, is_dist
     """Instantiate DynamicsModel from a checkpoint's saved config and load weights."""
     import torch
     from models.dynamics import DynamicsModel
-    model_sd = torch.load(Path(checkpoint_path) / MODEL_CHECKPOINT, map_location='cpu', weights_only=True)
-    state_cfg = torch.load(Path(checkpoint_path) / STATE, map_location='cpu', weights_only=False)
+    model_sd, state_cfg = _read_checkpoint(checkpoint_path)
     cfg = state_cfg.get('config', {}) or {}
     frame_size = cfg.get('frame_size', 128)
     # Infer conditioning_dim from checkpoint if missing

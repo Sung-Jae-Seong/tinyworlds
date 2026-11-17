@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import torch
 import torch.optim as optim
 
@@ -79,3 +80,16 @@ def _split_decay_params(model):
             else:
                 decay.append(param)
     return decay, no_decay
+
+def create_cosine_scheduler(optimizer, total_steps, warmup_fraction=0.05, min_lr_fraction=0.01):
+    warmup_steps = int(total_steps * warmup_fraction)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        cosine = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_lr_fraction + (1 - min_lr_fraction) * cosine
+
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)

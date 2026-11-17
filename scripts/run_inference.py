@@ -1,5 +1,5 @@
 import torch
-from datasets.data_utils import load_data_and_data_loaders
+from utils.datasets import load_data_and_data_loaders
 import matplotlib.pyplot as plt
 import time
 import os
@@ -8,7 +8,7 @@ import glob
 import re
 from utils.utils import load_videotokenizer_from_checkpoint, load_latent_actions_from_checkpoint, load_dynamics_from_checkpoint, find_latest_checkpoint
 from utils.config import InferenceConfig, load_config
-from utils.inference_utils import load_models, visualize_inference, sample_random_action, get_action_latent
+from utils.inference_utils import load_models, visualize_inference, get_action_latent, create_action_quantizer
 from einops import repeat
 from typing import Optional
 
@@ -24,6 +24,7 @@ def main():
 
     # whether any setting requires using action tokens
     use_latent_actions = (args.use_actions or args.use_gt_actions or args.use_interactive_mode)
+    need_action_checkpoint = args.use_gt_actions and not args.use_interactive_mode
 
     # check if any path is missing
     def missing(path: Optional[str]) -> bool:
@@ -34,7 +35,7 @@ def main():
     if args.use_latest_checkpoints or missing(args.video_tokenizer_path):
         vt_ckpt = find_latest_checkpoint(base_dir, "video_tokenizer")
         args.video_tokenizer_path = vt_ckpt
-    if (args.use_latest_checkpoints or missing(args.latent_actions_path)) and use_latent_actions:
+    if (args.use_latest_checkpoints or missing(args.latent_actions_path)) and need_action_checkpoint:
         lam_ckpt = find_latest_checkpoint(base_dir, "latent_actions")
         args.latent_actions_path = lam_ckpt
     if args.use_latest_checkpoints or missing(args.dynamics_path):
@@ -43,23 +44,23 @@ def main():
     
     # confirm which ckpts are being used
     print(f"Using video_tokenizer checkpoint: {args.video_tokenizer_path}")
-    if use_latent_actions:
+    if need_action_checkpoint:
         print(f"Using latent_actions checkpoint: {args.latent_actions_path}")
     print(f"Using dynamics checkpoint: {args.dynamics_path}")
 
     # validate required paths
     if missing(args.video_tokenizer_path):
         raise FileNotFoundError("video_tokenizer_path is not set or not a file. Set it in configs/inference.yaml or enable use_latest_checkpoints with available runs.")
-    if use_latent_actions and missing(args.latent_actions_path):
+    if need_action_checkpoint and missing(args.latent_actions_path):
         raise FileNotFoundError("latent_actions_path is not set or not a file while actions are requested. Set it in configs/inference.yaml or enable use_latest_checkpoints.")
     if missing(args.dynamics_path):
         raise FileNotFoundError("dynamics_path is not set or not a file. Set it in configs/inference.yaml or enable use_latest_checkpoints.")
  
     # load models, optionally compile
-    video_tokenizer, latent_action_model, dynamics_model = load_models(args.video_tokenizer_path, args.latent_actions_path, args.dynamics_path, args.device, use_actions=use_latent_actions)
+    video_tokenizer, latent_action_model, dynamics_model = load_models(args.video_tokenizer_path, args.latent_actions_path, args.dynamics_path, args.device, use_gt_actions=need_action_checkpoint)
     if args.compile:
         video_tokenizer = torch.compile(video_tokenizer, mode="reduce-overhead", fullgraph=False, dynamic=True)
-        if use_latent_actions:
+        if need_action_checkpoint:
             latent_action_model = torch.compile(latent_action_model, mode="reduce-overhead", fullgraph=False, dynamic=True)
         dynamics_model = torch.compile(dynamics_model, mode="reduce-overhead", fullgraph=False, dynamic=True)
         print("Compiled all models for inference.")
@@ -77,7 +78,7 @@ def main():
 
     # sample random batch
     random_idx = random.randint(0, len(data_loader.dataset) - 1)
-    og_ground_truth_frames = data_loader.dataset[random_idx][0]  # full sequence
+    og_ground_truth_frames = data_loader.dataset[random_idx]  # full sequence
     og_ground_truth_frames = og_ground_truth_frames.unsqueeze(0).to(args.device)  # [1, frames_to_load, C, H, W]
 
     ground_truth_frames = og_ground_truth_frames[:, :frames_to_load, :, :, :]  # [1, frames_to_load, C, H, W]
@@ -87,10 +88,11 @@ def main():
     generated_frames = context_frames.clone()
 
     # initialize actions
-    n_actions = None
+    n_actions = args.n_actions
     inferred_actions = []
-    if use_latent_actions:
-        n_actions = latent_action_model.quantizer.codebook_size        
+    action_quantizer = create_action_quantizer(n_actions, args.device) if use_latent_actions else None
+    if need_action_checkpoint and latent_action_model.quantizer.codebook_size != n_actions:
+        raise ValueError("n_actions differs from the loaded Latent Action Model codebook")        
 
     # ensure we don’t exceed available GT frames if in teacher-forced mode
     max_possible_steps = ground_truth_frames.shape[1] - args.context_window
@@ -112,7 +114,7 @@ def main():
         video_indices = video_tokenizer.tokenize(context_frames)
         video_latents = video_tokenizer.quantizer.get_latents_from_indices(video_indices)
 
-        sampled_action_index, action_latent = get_action_latent(args, inferred_actions, n_actions, context_frames, latent_action_model, i)
+        sampled_action_index, action_latent = get_action_latent(args, inferred_actions, n_actions, context_frames, action_quantizer, latent_action_model, i)
 
         # dynamics forward inference needs idx -> latents fun
         def idx_to_latents(idx):

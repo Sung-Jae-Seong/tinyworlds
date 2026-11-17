@@ -1,4 +1,3 @@
-from models.utils import ModelType
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -100,7 +99,7 @@ class LatentActionModel(nn.Module):
     def __init__(self, frame_size=(128, 128), n_actions=8, patch_size=8, embed_dim=128, 
                  num_heads=8, hidden_dim=256, num_blocks=4):
         super().__init__()
-        assert math.log(n_actions, NUM_LATENT_ACTIONS_BINS).is_integer(), f"n_actions must be a power of {NUM_LATENT_ACTIONS_BINS}"
+        assert n_actions >= 2 and n_actions & (n_actions - 1) == 0, "n_actions must be a power of 2"
         self.action_dim=int(math.log(n_actions, NUM_LATENT_ACTIONS_BINS))
         self.encoder = LatentActionsEncoder(frame_size, patch_size, embed_dim, num_heads, hidden_dim, num_blocks, action_dim=self.action_dim)
         self.quantizer = FiniteScalarQuantizer(latent_dim=self.action_dim, num_bins=NUM_LATENT_ACTIONS_BINS)
@@ -134,6 +133,3 @@ class LatentActionModel(nn.Module):
         action_latents_quantized = self.quantizer(action_latents) # [B, T, A]
         return action_latents_quantized
     
-    @property
-    def model_type(self) -> str:
-        return ModelType.LatentActionModel

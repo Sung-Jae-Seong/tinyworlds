@@ -5,19 +5,32 @@ import matplotlib.pyplot as plt
 import cv2
 import numpy as np
 from utils.utils import load_videotokenizer_from_checkpoint, load_latent_actions_from_checkpoint, load_dynamics_from_checkpoint
-from einops import repeat
+from models.fsq import FiniteScalarQuantizer
+import math
 
-def load_models(video_tokenizer_path, latent_actions_path, dynamics_path, device, use_actions=True):
-    # Load tokenizer and dynamics, and Latent Actions if using actions
-    video_tokenizer, _vt_ckpt = load_videotokenizer_from_checkpoint(video_tokenizer_path, device)
+def load_models(video_tokenizer_path, latent_actions_path, dynamics_path, device,
+                use_gt_actions=False):
+    """Only load the trained latent-action network when GT action inference needs it."""
+    video_tokenizer, _ = load_videotokenizer_from_checkpoint(video_tokenizer_path, device)
+    dynamics_model, _ = load_dynamics_from_checkpoint(dynamics_path, device)
     video_tokenizer.eval()
-    latent_action_model = None
-    if use_actions:
-        latent_action_model, _latent_action_ckpt = load_latent_actions_from_checkpoint(latent_actions_path, device)
-        latent_action_model.eval()
-    dynamics_model, _dyn_ckpt = load_dynamics_from_checkpoint(dynamics_path, device)
     dynamics_model.eval()
+
+    latent_action_model = None
+    if use_gt_actions:
+        latent_action_model, _ = load_latent_actions_from_checkpoint(latent_actions_path, device)
+        latent_action_model.eval()
+
     return video_tokenizer, latent_action_model, dynamics_model
+
+
+def create_action_quantizer(n_actions, device):
+    """FSQ has a fixed grid, so no latent-action checkpoint is needed for ID decoding."""
+    if n_actions < 2 or n_actions & (n_actions - 1):
+        raise ValueError("n_actions must be a power of two, at least 2")
+    return FiniteScalarQuantizer(
+        latent_dim=int(math.log2(n_actions)), num_bins=2
+    ).to(device)
 
 
 def visualize_inference(predicted_frames, ground_truth_frames, inferred_actions, fps, use_actions=True):
@@ -37,11 +50,7 @@ def visualize_inference(predicted_frames, ground_truth_frames, inferred_actions,
     _, num_gt_frames, _, _, _ = ground_truth_frames.shape
     
     # Create figure with ground truth and predictions side by side
-    fig, axes = plt.subplots(2, T, figsize=(4 * T, 8))
-    
-    # Handle single subplot case
-    if T == 1:
-        axes = axes.reshape(2, 1)
+    fig, axes = plt.subplots(2, T, figsize=(4 * T, 8), squeeze=False)
 
     # Plot ground truth frames (top row)
     for i in range(num_gt_frames):
@@ -98,7 +107,7 @@ def save_frames_as_mp4(frames, output_path, fps=2):
     B, T, C, H, W = frames.shape
 
     # OpenCV expects (W, H)
-    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
 
     for i in range(T):
@@ -124,52 +133,32 @@ def sample_random_action(n_actions):
     return random_action
 
 
-def get_action_latent(args, inferred_actions, n_actions, context_frames, latent_action_model, step):
-    if args.use_interactive_mode: # let user input actions
-        print("using interactive mode")
-        user_input = input(f"Enter action id [0..{n_actions-1}] for step {step+1}: ").strip()
+def get_action_latent(args, inferred_actions, n_actions, context_frames,
+                      action_quantizer, latent_action_model, step):
+    if not (args.use_interactive_mode or args.use_gt_actions or args.use_actions):
+        return None, None
 
-        assert user_input.isdigit() and 0 <= int(user_input) < n_actions, f"Invalid input. Please enter an integer in [0,{n_actions-1}]"
-        val = int(user_input)
-        sampled_action_index = torch.tensor([val], device=args.device)
-
-        inferred_actions.append(sampled_action_index)
-        recent = inferred_actions[-args.context_window:] if len(inferred_actions) > args.context_window else inferred_actions
-        recent_tensor = repeat(torch.tensor(recent, device=args.device), 'i -> 1 i') # [1, i or T_ctx]
-        action_latent = latent_action_model.quantizer.get_latents_from_indices(recent_tensor)
-        
-        if args.prediction_horizon > 1:
-            action_latent = repeat(action_latent, 'b 1 a -> b ph a', ph=args.prediction_horizon)
-        if len(recent) < args.context_window:
-            gt_pad_actions = latent_action_model.encode(context_frames[:, :args.context_window - len(recent) + 1])
-            quantized_gt_pad_actions = latent_action_model.quantizer(gt_pad_actions)
-            action_latent = torch.cat([quantized_gt_pad_actions, action_latent], dim=1)
-    elif args.use_gt_actions: # use action tokenizer actions
-        print("using gt actions")
-        gt_action_latents = latent_action_model.encode(context_frames) # [1, T - 1, A]
-        sampled_action_index = sample_random_action(n_actions) # [1]
-        inferred_actions.append(sampled_action_index) # [i]
-        sampled_action_index_tensor = repeat(torch.tensor(sampled_action_index, device=args.device), 'i -> 1 i') # [1, i]
-        sampled_action_latent = latent_action_model.quantizer.get_latents_from_indices(sampled_action_index_tensor) # [1, i, A]
-        action_latent = torch.cat([gt_action_latents, sampled_action_latent], dim=1) # [1, T, A]
-    elif args.use_actions: # use random actions
-        print(f"using random actions")
-        sampled_action_index = sample_random_action(n_actions) # [1]
-        inferred_actions.append(sampled_action_index) # [i]
-        recent_inferred_actions = inferred_actions[-args.context_window:] if len(inferred_actions) > args.context_window else inferred_actions # [i or T_ctx]
-        recent_inferred_actions_tensor = repeat(torch.tensor(recent_inferred_actions, device=args.device), 'i -> 1 i') # [1, i or T_ctx]
-
-        action_latent = latent_action_model.quantizer.get_latents_from_indices(recent_inferred_actions_tensor) # [1, i or T_ctx, A]
-        if args.prediction_horizon > 1:
-            action_latent = repeat(action_latent, 'b 1 a -> b ph a', ph=args.prediction_horizon)
-
-        if len(recent_inferred_actions) < args.context_window:
-            # if we dont have enough inferred actions (in the beginning) add enough gt to fill the sequence
-            gt_pad_actions = latent_action_model.encode(context_frames[:, :args.context_window - len(recent_inferred_actions) + 1])  # [1, context_window - len(inferred_actions), A]
-            quantized_gt_pad_actions = latent_action_model.quantizer(gt_pad_actions) # [1, context_window - len(inferred_actions), A]
-            action_latent = torch.cat([quantized_gt_pad_actions, action_latent], dim=1) # [1, S, A]
+    if args.use_interactive_mode:
+        action_id = int(input(f"Enter action id for step {step + 1}: "))
     else:
-        sampled_action_index = None
-        action_latent = None
+        action_id = torch.randint(n_actions, ()).item()
 
-    return sampled_action_index, action_latent
+    action = torch.tensor([action_id], device=args.device, dtype=torch.long)
+
+    if args.use_gt_actions and not args.use_interactive_mode:
+        if latent_action_model is None:
+            raise ValueError("use_gt_actions requires the trained Latent Action Model")
+        with torch.no_grad():
+            past_latents = latent_action_model.encode(context_frames)
+    else:
+        past_length = context_frames.shape[1] - 1
+        past_ids = [a.item() for a in inferred_actions][-past_length:] if past_length else []
+        past_ids = [action_id] * (past_length - len(past_ids)) + past_ids
+        past_latents = action_quantizer.get_latents_from_indices(
+            torch.tensor([past_ids], device=args.device, dtype=torch.long)
+        )
+
+    future_ids = action.repeat(args.prediction_horizon).unsqueeze(0)
+    future_latents = action_quantizer.get_latents_from_indices(future_ids)
+    inferred_actions.append(action)
+    return action, torch.cat([past_latents, future_latents], dim=1)
