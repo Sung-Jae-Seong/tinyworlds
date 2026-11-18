@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from einops import repeat
 
 class RMSNorm(nn.Module):
     def __init__(self, embed_dim, eps=1e-5):
@@ -56,19 +55,15 @@ class AdaptiveNormalizer(nn.Module):
             return normed
 
         x = self.ln(x)
-        B, T, P, E = x.shape
         out = self.to_gamma_beta(conditioning) # [B, T, 2 * E]
-        out = repeat(out, 'b t twoe -> b t p twoe', p=P) # [B, T, P, 2 * E]
-        gamma, beta = out.chunk(2, dim=-1) # each [B, T, P, E]
 
         # preppend action tensor with zeros in T since a_t-1 should impact z_t (and a_0 is used for z_1 etc)
-        if gamma.shape[1] == x.shape[1] - 1 and beta.shape[1] == x.shape[1] - 1:
-            gamma = torch.cat([torch.zeros_like(gamma[:, :1]), gamma], dim=1)
-            beta = torch.cat([torch.zeros_like(beta[:, :1]), beta], dim=1)
+        if out.shape[1] == x.shape[1] - 1:
+            out = torch.cat([torch.zeros_like(out[:, :1]), out], dim=1)
 
-        assert gamma.shape[1] == x.shape[1], f"gamma shape: {gamma.shape} != x shape: {x.shape}"
-        assert beta.shape[1] == x.shape[1], f"beta shape: {beta.shape} != x shape: {x.shape}"
-        x = x * (1 + gamma) + beta # [B, T, P, E]
+        assert out.shape[1] == x.shape[1], f"conditioning shape: {out.shape} != x shape: {x.shape}"
+        gamma, beta = out.chunk(2, dim=-1)
+        x = x * (1 + gamma[:, :, None]) + beta[:, :, None] # [B, T, P, E]
         return x
 
 

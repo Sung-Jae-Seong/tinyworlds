@@ -7,7 +7,7 @@ import math
 import torch.nn.functional as F
 
 class SpatialAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, conditioning_dim=None, pos_encoding="sinusoidal", grid_size=None, norm_cls=FiLMResidualNorm):
+    def __init__(self, embed_dim, num_heads, conditioning_dim=None, pos_encoding="sinusoidal", grid_size=None, norm_cls=FiLMResidualNorm, qk_norm=False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -22,6 +22,7 @@ class SpatialAttention(nn.Module):
         self.norm = norm_cls(embed_dim, conditioning_dim)
         self.pos_encoding = pos_encoding
         self.grid_size = grid_size
+        self.qk_norm = qk_norm
 
     def forward(self, x, conditioning=None):
         B, T, P, E = x.shape
@@ -32,6 +33,10 @@ class SpatialAttention(nn.Module):
         q = rearrange(self.q_proj(x_in), 'B T P (H D) -> (B T) H P D', H=self.num_heads)
         k = rearrange(self.k_proj(x_in), 'B T P (H D) -> (B T) H P D', H=self.num_heads)
         v = rearrange(self.v_proj(x_in), 'B T P (H D) -> (B T) H P D', H=self.num_heads)
+
+        if self.qk_norm:
+            q = F.rms_norm(q, (self.head_dim,))
+            k = F.rms_norm(k, (self.head_dim,))
 
         if self.pos_encoding == 'rope':
             cos, sin = rope_2d_cos_sin(*self.grid_size, self.head_dim, x.device, q.dtype)
@@ -55,7 +60,7 @@ class SpatialAttention(nn.Module):
         return out # [B, T, P, E]
 
 class TemporalAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, causal=True, conditioning_dim=None, pos_encoding="sinusoidal", norm_cls=FiLMResidualNorm):
+    def __init__(self, embed_dim, num_heads, causal=True, conditioning_dim=None, pos_encoding="sinusoidal", norm_cls=FiLMResidualNorm, qk_norm=False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -70,6 +75,7 @@ class TemporalAttention(nn.Module):
         self.norm = norm_cls(embed_dim, conditioning_dim)
         self.causal = causal
         self.pos_encoding = pos_encoding
+        self.qk_norm = qk_norm
         
     def forward(self, x, conditioning=None):
         B, T, P, E = x.shape
@@ -80,6 +86,10 @@ class TemporalAttention(nn.Module):
         q = rearrange(self.q_proj(x_in), 'b t p (h d) -> (b p) h t d', h=self.num_heads)
         k = rearrange(self.k_proj(x_in), 'b t p (h d) -> (b p) h t d', h=self.num_heads)
         v = rearrange(self.v_proj(x_in), 'b t p (h d) -> (b p) h t d', h=self.num_heads) # [B, P, H, T, D]
+
+        if self.qk_norm:
+            q = F.rms_norm(q, (self.head_dim,))
+            k = F.rms_norm(k, (self.head_dim,))
 
         if self.pos_encoding == 'rope':
             cos, sin = rope_1d_cos_sin(T, self.head_dim, x.device, q.dtype)
@@ -206,10 +216,10 @@ class MoESwiGLUFFN(nn.Module):
 class STTransformerBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, hidden_dim, causal=True, conditioning_dim=None,
                  use_moe=False, num_experts=4, top_k_experts=2, moe_aux_loss_coeff=0.01,
-                 pos_encoding="sinusoidal", grid_size=None, norm_cls=FiLMResidualNorm):
+                 pos_encoding="sinusoidal", grid_size=None, norm_cls=FiLMResidualNorm, qk_norm=False):
         super().__init__()
-        self.spatial_attn = SpatialAttention(embed_dim, num_heads, conditioning_dim, pos_encoding, grid_size, norm_cls)
-        self.temporal_attn = TemporalAttention(embed_dim, num_heads, causal, conditioning_dim, pos_encoding, norm_cls)
+        self.spatial_attn = SpatialAttention(embed_dim, num_heads, conditioning_dim, pos_encoding, grid_size, norm_cls, qk_norm)
+        self.temporal_attn = TemporalAttention(embed_dim, num_heads, causal, conditioning_dim, pos_encoding, norm_cls, qk_norm)
         if use_moe:
             self.ffn = MoESwiGLUFFN(
                 embed_dim, hidden_dim,
@@ -232,7 +242,7 @@ class STTransformerBlock(nn.Module):
 class STTransformer(nn.Module):
     def __init__(self, embed_dim, num_heads, hidden_dim, num_blocks, causal=True, conditioning_dim=None,
                  use_moe=False, num_experts=4, top_k_experts=2, moe_aux_loss_coeff=0.01,
-                 pos_encoding="sinusoidal", grid_size=None, use_adaln_zero=False):
+                 pos_encoding="sinusoidal", grid_size=None, use_adaln_zero=False, qk_norm=False):
         super().__init__()
         self.pos_encoding = pos_encoding
         norm_cls = AdaLNZeroNorm if use_adaln_zero else FiLMResidualNorm
@@ -246,7 +256,7 @@ class STTransformer(nn.Module):
                 use_moe=use_moe, num_experts=num_experts,
                 top_k_experts=top_k_experts, moe_aux_loss_coeff=moe_aux_loss_coeff,
                 pos_encoding=pos_encoding, grid_size=grid_size,
-                norm_cls=norm_cls,
+                norm_cls=norm_cls, qk_norm=qk_norm,
             )
             for _ in range(num_blocks)
         ])

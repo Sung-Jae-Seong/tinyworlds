@@ -112,26 +112,9 @@ def save_training_state(model, optimizer, scheduler, config, checkpoints_dir, pr
     """Save model, optimizer, scheduler metadata, and config under a step directory."""
     import torch
     ts = readable_timestamp()
-    if isinstance(model, (FSDPModule, DDP)):
-        state_dict = get_model_state_dict(
-            model=model,
-            options=StateDictOptions(
-                full_state_dict=True,
-                cpu_offload=True,
-            ),
-        )
-        optimizer_state_dict = get_optimizer_state_dict(
-            model=model,
-            optimizers=optimizer,
-            options=StateDictOptions(
-                full_state_dict=True,
-                cpu_offload=True,
-            ),
-        )
-    else:
-        # Avoid saving the model with _orig_mod prefix if it's compiled
-        state_dict = getattr(model, '_orig_mod', model).state_dict()
-        optimizer_state_dict = optimizer.state_dict()
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    state_dict = get_model_state_dict(model=model, options=options)
+    optimizer_state_dict = get_optimizer_state_dict(model=model, optimizers=optimizer, options=options)
     state = {
         'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'config': config,
@@ -256,9 +239,12 @@ def load_dynamics_from_checkpoint(checkpoint_path, device, model = None, is_dist
         'moe_aux_loss_coeff': cfg.get('moe_aux_loss_coeff', 0.01),
         'pos_encoding': cfg.get('pos_encoding', 'sinusoidal'),
         'use_adaln_zero': cfg.get('use_adaln_zero', False),
+        'qk_norm': cfg.get('qk_norm', False),
     }
     if model is None:
         model = DynamicsModel(**kwargs)
+    for block in model.transformer.blocks:
+        block.spatial_attn.qk_norm = block.temporal_attn.qk_norm = kwargs['qk_norm']
     set_model_state_dict(
         model=model,
         model_state_dict=model_sd,

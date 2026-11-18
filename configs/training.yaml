@@ -1,7 +1,3 @@
-# wandb
-use_wandb: true
-wandb_project: tinyworlds
-
 # dataset
 dataset: PICODOOM
 preload_ratio: 0.005
@@ -15,6 +11,8 @@ num_bins: 4 # for video tokenizer
 pos_encoding: sinusoidal # sinusoidal or rope
 use_adaln_zero: false # false: FiLM / RMSNorm, true: AdaLN-Zero
 n_actions: 4
+device: cuda
+fps: null
 
 # performance
 amp: true
@@ -26,6 +24,11 @@ distributed:
   use_ddp: False
   use_fsdp: False
   reshard_after_forward: False
+  fsdp_mixed_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: float32
+    cast_forward_inputs: true
 nproc_per_node: 1 # how many GPUs per node
 standalone: true # if we're using one node, this eliminates extraneous processes
 

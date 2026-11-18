@@ -1,6 +1,5 @@
 # paths (need if not get latest)
 video_tokenizer_path: 
-latent_actions_path: 
 dynamics_path: 
 use_latest_checkpoints: true
 n_actions: 16 # must match Dynamics training action dimension/codebook
@@ -16,10 +15,9 @@ temperature: 0.5 # 0 is argmax
 teacher_forced: false # for testing/dev
 prediction_horizon: 1 # how many masked frames to append and decode at a time
 maskgit_schedule: "exp" # exp or cosine
+maskgit_num_steps: 10
 
 # action selection modes (lower takes priority)
-use_actions: false # use random actions
-use_gt_actions: false # use lam-inferred actions
 use_interactive_mode: true # use user-inputted actions
 
 # inference acceleration

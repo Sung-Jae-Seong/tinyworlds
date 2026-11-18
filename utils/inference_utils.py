@@ -4,24 +4,17 @@ import os
 import matplotlib.pyplot as plt
 import cv2
 import numpy as np
-from utils.utils import load_videotokenizer_from_checkpoint, load_latent_actions_from_checkpoint, load_dynamics_from_checkpoint
+from utils.utils import load_videotokenizer_from_checkpoint, load_dynamics_from_checkpoint
 from models.fsq import FiniteScalarQuantizer
 import math
 
-def load_models(video_tokenizer_path, latent_actions_path, dynamics_path, device,
-                use_gt_actions=False):
-    """Only load the trained latent-action network when GT action inference needs it."""
+def load_models(video_tokenizer_path, dynamics_path, device):
     video_tokenizer, _ = load_videotokenizer_from_checkpoint(video_tokenizer_path, device)
     dynamics_model, _ = load_dynamics_from_checkpoint(dynamics_path, device)
     video_tokenizer.eval()
     dynamics_model.eval()
 
-    latent_action_model = None
-    if use_gt_actions:
-        latent_action_model, _ = load_latent_actions_from_checkpoint(latent_actions_path, device)
-        latent_action_model.eval()
-
-    return video_tokenizer, latent_action_model, dynamics_model
+    return video_tokenizer, dynamics_model
 
 
 def create_action_quantizer(n_actions, device):
@@ -33,7 +26,7 @@ def create_action_quantizer(n_actions, device):
     ).to(device)
 
 
-def visualize_inference(predicted_frames, ground_truth_frames, inferred_actions, fps, use_actions=True):
+def visualize_inference(predicted_frames, ground_truth_frames, inferred_actions, fps):
     # Move to CPU and convert to numpy
     predicted_frames = predicted_frames.detach().cpu()
     ground_truth_frames = ground_truth_frames.detach().cpu()
@@ -64,8 +57,8 @@ def visualize_inference(predicted_frames, ground_truth_frames, inferred_actions,
         frame = predicted_frames[0, i].permute(1, 2, 0).numpy()  # [H, W, C]
         axes[1, i].imshow(frame)
         title = f'Predicted {i+1}'
-        if use_actions and i < len(inferred_actions):
-            title += f'\nAction {inferred_actions[i].item()}' if i < len(inferred_actions) else ''
+        if i < len(inferred_actions):
+            title += f'\nAction {inferred_actions[i].item()}'
         axes[1, i].set_title(title, fontsize=12, color='red')
         axes[1, i].axis('off')
     
@@ -76,12 +69,8 @@ def visualize_inference(predicted_frames, ground_truth_frames, inferred_actions,
     save_dir = "inference_results"
     os.makedirs(save_dir, exist_ok=True)
     
-    if use_actions:
-        save_path = os.path.join(save_dir, f"inference_results_gt_vs_pred_{timestamp}.png")
-        mp4_path = os.path.join(save_dir, f"inference_video_{timestamp}.mp4")
-    else:
-        save_path = os.path.join(save_dir, f"inference_results_gt_vs_pred_no_actions_{timestamp}.png")
-        mp4_path = os.path.join(save_dir, f"inference_video_no_actions_{timestamp}.mp4")
+    save_path = os.path.join(save_dir, f"inference_results_gt_vs_pred_{timestamp}.png")
+    mp4_path = os.path.join(save_dir, f"inference_video_{timestamp}.mp4")
     
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -96,10 +85,7 @@ def visualize_inference(predicted_frames, ground_truth_frames, inferred_actions,
     print(f"\nInference stats:")
     print(f"Total frames generated: {T}")
     print(f"Mean Squared Error (GT vs Pred): {mse_error:.6f}")
-    if use_actions:
-        print(f"Actions used: {[action.item() for action in inferred_actions]}")
-    else:
-        print(f"No actions used.")
+    print(f"Actions used: {[action.item() for action in inferred_actions]}")
 
 
 # TODO: get working mp4
@@ -128,16 +114,8 @@ def save_frames_as_mp4(frames, output_path, fps=2):
     print(f"MP4 video saved to: {output_path}")
 
 
-def sample_random_action(n_actions):
-    random_action = torch.randint(0, n_actions, (1,))
-    return random_action
-
-
 def get_action_latent(args, inferred_actions, n_actions, context_frames,
-                      action_quantizer, latent_action_model, step):
-    if not (args.use_interactive_mode or args.use_gt_actions or args.use_actions):
-        return None, None
-
+                      action_quantizer, step):
     if args.use_interactive_mode:
         action_id = int(input(f"Enter action id for step {step + 1}: "))
     else:
@@ -145,20 +123,14 @@ def get_action_latent(args, inferred_actions, n_actions, context_frames,
 
     action = torch.tensor([action_id], device=args.device, dtype=torch.long)
 
-    if args.use_gt_actions and not args.use_interactive_mode:
-        if latent_action_model is None:
-            raise ValueError("use_gt_actions requires the trained Latent Action Model")
-        with torch.no_grad():
-            past_latents = latent_action_model.encode(context_frames)
-    else:
-        past_length = context_frames.shape[1] - 1
-        past_ids = [a.item() for a in inferred_actions][-past_length:] if past_length else []
-        past_ids = [action_id] * (past_length - len(past_ids)) + past_ids
-        past_latents = action_quantizer.get_latents_from_indices(
-            torch.tensor([past_ids], device=args.device, dtype=torch.long)
-        )
+    past_length = context_frames.shape[1] - 1
+    past_ids = [a.item() for a in inferred_actions][-past_length:] if past_length else []
+    past_ids = [action_id] * (past_length - len(past_ids)) + past_ids
+    past_latents = action_quantizer.get_latents_from_indices(
+        torch.tensor([past_ids], device=args.device, dtype=torch.long)
+    )
 
     future_ids = action.repeat(args.prediction_horizon).unsqueeze(0)
     future_latents = action_quantizer.get_latents_from_indices(future_ids)
-    inferred_actions.append(action)
+    inferred_actions.extend([action] * args.prediction_horizon)
     return action, torch.cat([past_latents, future_latents], dim=1)

@@ -2,8 +2,8 @@ import argparse
 import os
 import sys
 
-from utils.utils import run_command, find_latest_checkpoint, prepare_pipeline_run_root
-from utils.config import TrainingConfig, load_config
+from utils.utils import run_command, prepare_pipeline_run_root
+from utils.config_loader import load_yaml_config
 
 
 def main():
@@ -12,8 +12,8 @@ def main():
     args, _ = parser.parse_known_args()
     config_path = args.config
 
-    cfg: TrainingConfig = load_config(
-        TrainingConfig, default_config_path=config_path
+    cfg = load_yaml_config(
+        default_path=config_path
     )
 
     launcher = [sys.executable]
@@ -26,12 +26,11 @@ def main():
         base_cwd=os.getcwd()
     )[0]
 
-    def train(stage, config, name, overrides=()):
+    def train(stage, config, name):
         cmd = launcher + [
             f"scripts/{stage}",
             "--config", config,
             "--training_config", config_path,
-            *overrides,
         ]
         if not run_command(cmd, name):
             raise SystemExit(f"{name} failed")
@@ -51,17 +50,10 @@ def main():
         )
 
     if cfg.run_dynamics:
-        vt = find_latest_checkpoint(".", "video_tokenizer")
-        actions = find_latest_checkpoint(".", "latent_actions")
-
         train(
             "train_dynamics.py",
             cfg.dynamics_config,
             "Dynamics Model Training",
-            (
-                f"video_tokenizer_path={vt}",
-                f"latent_actions_path={actions}",
-            ),
         )
 
     print("Training pipeline finished.")

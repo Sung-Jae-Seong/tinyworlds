@@ -43,22 +43,16 @@ class VideoDataset(Dataset):
             ToTensor(), Normalize((0.5,) * 3, (0.5,) * 3),
         ])
 
-        if cache_path.exists():
-            with h5py.File(cache_path, "r") as f:
-                frames = f["frames"]
-                stop = max(0, min(len(frames), int(len(frames) * preload_ratio)))
-                # Keep the original cached-file ordering and start-index behavior.
-                chunks = [frames[i:min(i + 1000, stop)]
-                          for i in tqdm(range(start, stop, 1000), desc="Loading frames")]
-                self.data = np.concatenate(chunks) if chunks else np.empty(
-                    (0, size[1], size[0], 3), dtype=np.uint8)
-        else:
-            self.data = self._preprocess_video(video_path, size, read_step, video_slice)
+        if not cache_path.exists():
+            frames = self._preprocess_video(video_path, size, read_step, video_slice)
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             with h5py.File(cache_path, "w") as f:
-                f.create_dataset("frames", data=self.data, compression="lzf")
-            # Original code only applies start/preload to an existing cache.
-            # Keep that behavior in this draft rather than silently change data.
+                f.create_dataset("frames", data=frames, compression="lzf")
+
+        # One selection path for both freshly generated and existing caches.
+        with h5py.File(cache_path, "r") as f:
+            frames = f["frames"]
+            self.data = frames[start:int(len(frames) * preload_ratio)]
 
         if split:
             cutoff = int(len(self.data) * 0.9)
@@ -121,27 +115,26 @@ class TokenizedVideoDataset(Dataset):
         return self.tokens[index], self.actions[index]
 
 
+def load_dataset(dataset, num_frames=1, fps=15, preload_ratio=1, cached_tokens_path=None):
+    """Construct the dataset without creating data loaders."""
+    if cached_tokens_path:
+        return TokenizedVideoDataset(cached_tokens_path, num_frames)
+    if dataset not in DATASETS:
+        raise ValueError(f"Unknown dataset {dataset!r}; expected one of {list(DATASETS)}")
+    spec = DATASETS[dataset]
+    data_dir = Path.cwd() / "data"
+    options = dict(video_path=data_dir / spec["video"],
+                   cache_path=data_dir / spec["cache"], num_frames=num_frames,
+                   fps=30 if dataset == "PICODOOM" else fps, size=spec["size"],
+                   start=spec["start"], read_step=spec["read_step"],
+                   video_slice=spec.get("video_slice"), preload_ratio=preload_ratio)
+    return VideoDataset(**options, train=True, split=False)
+
+
 def load_data_and_data_loaders(dataset, batch_size, num_frames=1, distributed=False,
                                rank=0, world_size=1, fps=15, preload_ratio=1, cached_tokens_path=None):
-    """Preserve the five-value return API used by existing TinyWorlds scripts."""
-    if cached_tokens_path:
-        train_data = val_data = TokenizedVideoDataset(cached_tokens_path, num_frames)
-        variance = None
-    else:
-        if dataset not in DATASETS:
-            raise ValueError(f"Unknown dataset {dataset!r}; expected one of {list(DATASETS)}")
-        spec = DATASETS[dataset]
-        data_dir = Path.cwd() / "data"
-        options = dict(video_path=data_dir / spec["video"],
-                       cache_path=data_dir / spec["cache"], num_frames=num_frames,
-                       fps=30 if dataset == "PICODOOM" else fps, size=spec["size"],
-                       start=spec["start"], read_step=spec["read_step"],
-                       video_slice=spec.get("video_slice"), preload_ratio=preload_ratio)
-
-        # As in the upstream project, split=False gives the same data to train/val.
-        train_data = VideoDataset(**options, train=True, split=False)
-        val_data = VideoDataset(**options, train=False, split=False)
-        variance = np.var(train_data.data)
+    """Preserve the five-value return API; validation aliases the unsplit training data."""
+    train_data = load_dataset(dataset, num_frames, fps, preload_ratio, cached_tokens_path)
 
     def loader(data, shuffle):
         sampler = DistributedSampler(data, num_replicas=world_size, rank=rank,
@@ -152,8 +145,7 @@ def load_data_and_data_loaders(dataset, batch_size, num_frames=1, distributed=Fa
                           persistent_workers=True, prefetch_factor=2, drop_last=True)
 
     train_loader = loader(train_data, shuffle=True)
-    val_loader = loader(val_data, shuffle=True)
-    return train_data, val_data, train_loader, val_loader, variance
+    return train_data, train_data, train_loader, train_loader, None
 
 
 def visualize_reconstruction(original, reconstruction, save_path=None):

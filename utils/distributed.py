@@ -10,7 +10,7 @@ from torch.distributed.fsdp import fully_shard
 from models.video_tokenizer import VideoTokenizer
 from models.latent_actions import LatentActionModel
 from models.dynamics import DynamicsModel
-from utils.config import DistributedConfig
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 
 def init_distributed_from_env() -> Dict[str, object]:
@@ -37,7 +37,7 @@ def init_distributed_from_env() -> Dict[str, object]:
 
 def prepare_model_for_distributed(
     model: torch.nn.Module,
-    config: DistributedConfig,
+    config,
     device_mesh: DeviceMesh,
 ) -> torch.nn.Module:
 
@@ -50,65 +50,65 @@ def prepare_model_for_distributed(
         )
 
     if config.use_fsdp:
-        mp_policy = config.get_mixed_precision_policy()
-
+        precision = config.fsdp_mixed_precision
         fsdp_kwargs = {
             "reshard_after_forward": config.reshard_after_forward,
-            "mp_policy": mp_policy,
-            "offload_policy": config.offload_policy,
+            "mp_policy": MixedPrecisionPolicy(
+                param_dtype=getattr(torch, precision.param_dtype),
+                reduce_dtype=getattr(torch, precision.reduce_dtype),
+                output_dtype=getattr(torch, precision.output_dtype),
+                cast_forward_inputs=precision.cast_forward_inputs,
+            ),
         }
 
         def shard_layers(layers: Iterable[torch.nn.Module]) -> None:
             for layer in layers:
                 fully_shard(layer, mesh=device_mesh, **fsdp_kwargs)
 
-        # torch.compile()로 감싸진 모델도 구분할 수 있도록 처리
-        original_model = getattr(model, "_orig_mod", model)
+        if isinstance(model, (VideoTokenizer, LatentActionModel)):
+            shard_layers(model.encoder.transformer.blocks)
 
-        if isinstance(original_model, (VideoTokenizer, LatentActionModel)):
-            shard_layers(original_model.encoder.transformer.blocks)
+            if isinstance(model, VideoTokenizer):
+                shard_layers(model.encoder.latent_head)
 
-            if isinstance(original_model, VideoTokenizer):
-                shard_layers(original_model.encoder.latent_head)
-
-            if isinstance(original_model, LatentActionModel):
-                shard_layers(original_model.encoder.action_head)
-                shard_layers(original_model.decoder.transformer.blocks)
-                shard_layers(original_model.decoder.frame_head)
+            if isinstance(model, LatentActionModel):
+                shard_layers(model.encoder.action_head)
+                shard_layers(model.decoder.transformer.blocks)
+                shard_layers(model.decoder.frame_head)
 
             fully_shard(
-                original_model.encoder,
+                model.encoder,
                 mesh=device_mesh,
                 **fsdp_kwargs,
             )
             fully_shard(
-                original_model.decoder,
+                model.decoder,
                 mesh=device_mesh,
                 **fsdp_kwargs,
             )
             fully_shard(
-                original_model.quantizer,
+                model.quantizer,
                 mesh=device_mesh,
                 **fsdp_kwargs,
             )
 
-        elif isinstance(original_model, DynamicsModel):
-            shard_layers(original_model.transformer.blocks)
+        elif isinstance(model, DynamicsModel):
+            shard_layers(model.transformer.blocks)
 
             fully_shard(
-                original_model.latent_embed,
+                model.latent_embed,
                 mesh=device_mesh,
                 **fsdp_kwargs,
             )
             fully_shard(
-                original_model.output_mlp,
+                model.output_mlp,
                 mesh=device_mesh,
                 **fsdp_kwargs,
             )
 
         else:
             raise ValueError(
-                f"Unknown model type: {type(original_model).__name__}"
+                f"Unknown model type: {type(model).__name__}"
             )
 
         fully_shard(

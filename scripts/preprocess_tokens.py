@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from utils.datasets import load_data_and_data_loaders
+from utils.datasets import load_dataset
 from utils.utils import load_latent_actions_from_checkpoint, load_videotokenizer_from_checkpoint
 
 
@@ -36,8 +36,8 @@ def main():
     video_tokenizer.eval()
     latent_action_model.eval()
 
-    data, _, _, _, _ = load_data_and_data_loaders(
-        args.dataset, args.batch_size, num_frames=args.num_frames,
+    data = load_dataset(
+        args.dataset, num_frames=args.num_frames,
         fps=args.fps, preload_ratio=args.preload_ratio,
     )
     loader = DataLoader(data, batch_size=args.batch_size, shuffle=False, num_workers=2)

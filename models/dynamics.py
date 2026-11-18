@@ -3,13 +3,12 @@ import torch.nn as nn
 import math
 from models.positional_encoding import build_spatial_only_pe
 from models.st_transformer import STTransformer
-from einops import repeat
 
 class DynamicsModel(nn.Module):
     def __init__(self, frame_size=(128, 128), patch_size=4, embed_dim=128, num_heads=8,
                  hidden_dim=128, num_blocks=4, num_bins=4, conditioning_dim=3, latent_dim=5,
                  use_moe=False, num_experts=4, top_k_experts=2, moe_aux_loss_coeff=0.01,
-                 pos_encoding="sinusoidal", use_adaln_zero=False):
+                 pos_encoding="sinusoidal", use_adaln_zero=False, qk_norm=True):
         super().__init__()
         H, W = frame_size
         codebook_size = num_bins**latent_dim
@@ -22,7 +21,7 @@ class DynamicsModel(nn.Module):
             use_moe=use_moe, num_experts=num_experts,
             top_k_experts=top_k_experts, moe_aux_loss_coeff=moe_aux_loss_coeff,
             pos_encoding=pos_encoding, grid_size=(H // patch_size, W // patch_size),
-            use_adaln_zero=use_adaln_zero,
+            use_adaln_zero=use_adaln_zero, qk_norm=qk_norm,
         )
         self.output_mlp = nn.Linear(embed_dim, codebook_size)
 
@@ -43,20 +42,18 @@ class DynamicsModel(nn.Module):
         # convert latents to float for embedding
         discrete_latents = discrete_latents.to(dtype=torch.float32)
 
-        # apply MaskGIT random masking during training
+        # Match autoregressive rollout: preserve a complete past prefix and mask the future.
+        # Mix fully masked futures with partially revealed futures for MaskGIT refinement.
         if training and self.training:
-            # per-batch mask ratio in [0.5, 1.0)
-            mask_ratio = 0.5 + torch.rand((), device=discrete_latents.device) * 0.5 
-            mask_positions = (torch.rand(B, T, P, device=discrete_latents.device) < mask_ratio) # [B, T, P]
-
-            # guarantee at least one unmasked temporal anchor per (B, P)
-            # pick a random timestep for each (B,P) and force it to unmask
-            anchor_idx = torch.randint(0, T, (B, P), device=discrete_latents.device)  # [B, P]
-            mask_positions[torch.arange(B)[:, None], anchor_idx, torch.arange(P)[None, :]] = False # [B, T, P]
+            ratio = torch.rand((), device=discrete_latents.device)
+            ratio = torch.where(ratio < 0.5, 1.0, ratio)
+            mask_positions = (torch.arange(T, device=discrete_latents.device)[None, :, None] >=
+                              torch.randint(1, T, (), device=discrete_latents.device)) & (
+                                  torch.rand(B, T, P, device=discrete_latents.device) < ratio)
+            mask_positions[:, -1, 0] = True  # guarantee a supervised target
 
             # replace selected latents with mask tokens
-            mask_token = repeat(self.mask_token.to(discrete_latents.device, discrete_latents.dtype), '1 1 1 L -> B T P L', B=B, T=T, P=P) # [B, T, P, L]
-            discrete_latents = torch.where(mask_positions.unsqueeze(-1), mask_token, discrete_latents) # [B, T, P, L]
+            discrete_latents = torch.where(mask_positions.unsqueeze(-1), self.mask_token.to(discrete_latents), discrete_latents) # [B, T, P, L]
         else:
             mask_positions = None
 

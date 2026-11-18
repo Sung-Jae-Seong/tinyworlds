@@ -27,8 +27,6 @@ class LatentActionsEncoder(nn.Module):
 
     def forward(self, frames):
         # frames: [B, T, C, H, W]
-        batch_size, seq_len, C, H, W = frames.shape
-
         embeddings = self.patch_embed(frames)  # [B, T, P, E]
         transformed = self.transformer(embeddings)
 
@@ -37,16 +35,7 @@ class LatentActionsEncoder(nn.Module):
         pooled = transformed.mean(dim=2)  # [B, T, E]
 
         # combine features from current and next frame
-        actions = []
-        for t in range(seq_len - 1):
-            # concat current and next frame features
-            combined = torch.cat([pooled[:, t], pooled[:, t+1]], dim=1)  # [B, E*2]
-            action = self.action_head(combined)  # [B, A]
-            actions.append(action)
-
-        actions = torch.stack(actions, dim=1)  # [B, T-1, A]
-
-        return actions
+        return self.action_head(torch.cat([pooled[:, :-1], pooled[:, 1:]], dim=-1))
 
 class LatentActionsDecoder(nn.Module):
     def __init__(self, frame_size=(128, 128), patch_size=8, embed_dim=128, num_heads=8,
@@ -80,21 +69,16 @@ class LatentActionsDecoder(nn.Module):
         # mask certain tokens from all frames except first frame
         # this strongly forces actions to contain most useful info (I recommend to keep based on experiments)
         if training and self.training:
-            keep_rate = 0.0
-            keep = (torch.rand(B, T-1, P, 1, device=frames.device) < keep_rate)
-            keep[:, 0] = 1  # never mask first frame tokens (anchor) TODO: try rid of ablation
-            video_embeddings = torch.where(
-                keep, video_embeddings,
-                self.mask_token.to(video_embeddings.dtype).expand_as(video_embeddings)
-            )
+            video_embeddings = torch.cat([
+                video_embeddings[:, :1],
+                self.mask_token.to(video_embeddings.dtype).expand(B, T - 2, P, E),
+            ], dim=1)
 
         transformed = self.transformer(video_embeddings, conditioning=actions)  # [B, T-1, P, E]
         patches = self.frame_head(transformed)  # [B, T-1, P, 3 * S * S]
-        patches = rearrange(
-            patches, 'b t p (c p1 p2) -> b t c p p1 p2', c=3, p1=self.patch_size, p2=self.patch_size
-        ) # [B, T-1, C, P, S, S]
         pred_frames = rearrange(
-            patches, 'b t c (h w) p1 p2 -> b t c (h p1) (w p2)', h=H//self.patch_size, w=W//self.patch_size
+            patches, 'b t (h w) (c p1 p2) -> b t c (h p1) (w p2)',
+            c=3, p1=self.patch_size, p2=self.patch_size, h=H//self.patch_size
         ) # [B, T-1, C, H, W]
         return pred_frames  # [B, T-1, C, H, W]
 

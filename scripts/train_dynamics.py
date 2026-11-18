@@ -5,6 +5,7 @@ import os
 from tqdm import tqdm
 from einops import rearrange
 from models.dynamics import DynamicsModel
+from models.fsq import FiniteScalarQuantizer
 from utils.datasets import visualize_reconstruction, load_data_and_data_loaders
 from utils.optim import create_cosine_scheduler
 from utils.optim import create_optimizer
@@ -16,13 +17,13 @@ from utils.utils import (
     prepare_pipeline_run_root,
     prepare_stage_dirs,
 )
-from utils.config import DynamicsConfig, load_stage_config_merged
+from utils.config_loader import load_yaml_config
 from utils.distributed import init_distributed_from_env, prepare_model_for_distributed, unwrap_model, print_param_count_if_main, cleanup_distributed
 from torch.distributed.fsdp import FSDPModule
 
 def main():
     # dynamics config merged with training_config.yaml (training takes priority), plus CLI overrides
-    args: DynamicsConfig = load_stage_config_merged(DynamicsConfig, default_config_path=os.path.join(os.getcwd(), 'configs', 'dynamics.yaml'))
+    args = load_yaml_config(default_path=os.path.join(os.getcwd(), 'configs', 'dynamics.yaml'), stage=True)
     # DDP setup
     dist_setup = init_distributed_from_env()
 
@@ -37,18 +38,32 @@ def main():
         print(f"Results will be saved in {stage_dir}")
 
     # load video tokenizer and latent action model
+    args.video_tokenizer_path = args.video_tokenizer_path or max(
+        (Path(run_root) / "video_tokenizer" / "checkpoints").glob("video_tokenizer_step_*"),
+        key=lambda p: int(p.name.rsplit("_", 1)[-1]),
+    )
     video_tokenizer, _ = load_videotokenizer_from_checkpoint(
         checkpoint_path=args.video_tokenizer_path,
         device=args.device,
         is_distributed=dist_setup['is_distributed'],
     )
     video_tokenizer.eval().requires_grad_(False)
-    latent_action_model, _ = load_latent_actions_from_checkpoint(
-        checkpoint_path=args.latent_actions_path,
-        device=args.device,
-        is_distributed=dist_setup['is_distributed'],
-    )
-    unwrap_model(latent_action_model).eval().requires_grad_(False)
+    latent_action_model = None
+    if args.cached_tokens_path:
+        action_quantizer = FiniteScalarQuantizer(
+            latent_dim=args.n_actions.bit_length() - 1, num_bins=2
+        ).to(args.device)
+    else:
+        args.latent_actions_path = args.latent_actions_path or max(
+            (Path(run_root) / "latent_actions" / "checkpoints").glob("latent_actions_step_*"),
+            key=lambda p: int(p.name.rsplit("_", 1)[-1]),
+        )
+        latent_action_model, _ = load_latent_actions_from_checkpoint(
+            checkpoint_path=args.latent_actions_path,
+            device=args.device,
+            is_distributed=dist_setup['is_distributed'],
+        )
+        unwrap_model(latent_action_model).eval().requires_grad_(False)
 
     # init dynamics model and optional ckpt load
     dynamics_model = DynamicsModel(
@@ -58,7 +73,8 @@ def main():
         num_heads=args.num_heads,
         hidden_dim=args.hidden_dim,
         num_blocks=args.num_blocks,
-        conditioning_dim=unwrap_model(latent_action_model).action_dim,
+        conditioning_dim=(unwrap_model(latent_action_model).action_dim
+                          if latent_action_model is not None else args.n_actions.bit_length() - 1),
         latent_dim=args.latent_dim,
         num_bins=args.num_bins,
         use_moe=args.use_moe,
@@ -67,6 +83,7 @@ def main():
         moe_aux_loss_coeff=args.moe_aux_loss_coeff,
         pos_encoding=args.pos_encoding,
         use_adaln_zero=args.use_adaln_zero,
+        qk_norm=args.qk_norm,
     ).to(args.device)
     if args.checkpoint:
         dynamics_model, _ = load_dynamics_from_checkpoint(
@@ -80,14 +97,17 @@ def main():
     print_param_count_if_main(dynamics_model, "DynamicsModel", is_main)
     if args.compile:
         video_tokenizer = torch.compile(video_tokenizer, mode="reduce-overhead", fullgraph=False, dynamic=True)
-        latent_action_model = torch.compile(latent_action_model, mode="reduce-overhead", fullgraph=False, dynamic=True)
-        dynamics_model = torch.compile(dynamics_model, mode="reduce-overhead", fullgraph=False, dynamic=True)
-        print("Compiled all models for training.")
+        if latent_action_model is not None:
+            latent_action_model = torch.compile(latent_action_model, mode="reduce-overhead", fullgraph=False, dynamic=True)
     dynamics_model = prepare_model_for_distributed(
         dynamics_model, 
         args.distributed, 
         device_mesh=dist_setup['device_mesh'],
     )
+    fsdp_model = dynamics_model if isinstance(dynamics_model, FSDPModule) else None
+    if args.compile:
+        dynamics_model = torch.compile(dynamics_model, mode="reduce-overhead", fullgraph=False, dynamic=True)
+        print("Compiled all models for training.")
     if args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -126,8 +146,8 @@ def main():
         update_loss = torch.zeros((), device=args.device)
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
-        if isinstance(dynamics_model, FSDPModule):
-            dynamics_model.set_requires_gradient_sync(False)
+        if fsdp_model is not None:
+            fsdp_model.set_requires_gradient_sync(False)
         if args.compile:
             torch.compiler.cudagraph_mark_step_begin()
         for micro_batch in range(args.gradient_accumulation_steps):
@@ -140,12 +160,11 @@ def main():
             if using_cached_tokens:
                 video_tokens, action_tokens = (t.to(args.device, non_blocking=True) for t in x)
                 video_tokens = video_tokens.long()
-                quantized_actions = (latent_action_model.quantizer.get_latents_from_indices(action_tokens)
-                                     if args.use_actions else None)
+                quantized_actions = action_quantizer.get_latents_from_indices(action_tokens)
             else:
                 x = x.to(args.device, non_blocking=True)
                 video_tokens = video_tokenizer.tokenize(x)
-                quantized_actions = latent_action_model.encode(x) if args.use_actions else None
+                quantized_actions = latent_action_model.encode(x)
 
             video_latents = video_tokenizer.quantizer.get_latents_from_indices(video_tokens, dim=-1)
 
@@ -160,8 +179,8 @@ def main():
                     aux_loss = unwrap_model(dynamics_model).transformer.moe_aux_loss()
                     loss = loss + aux_loss
 
-                if isinstance(dynamics_model, FSDPModule) and micro_batch + 1 == args.gradient_accumulation_steps:
-                    dynamics_model.set_requires_gradient_sync(True)
+                if fsdp_model is not None and micro_batch + 1 == args.gradient_accumulation_steps:
+                    fsdp_model.set_requires_gradient_sync(True)
 
                 loss /= args.gradient_accumulation_steps
                 update_loss += loss.detach()

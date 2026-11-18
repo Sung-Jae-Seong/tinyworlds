@@ -7,13 +7,13 @@ from utils.optim import create_cosine_scheduler
 from utils.optim import create_optimizer
 from tqdm import tqdm
 from utils.utils import save_training_state, prepare_stage_dirs, prepare_pipeline_run_root, load_videotokenizer_from_checkpoint
-from utils.config import VideoTokenizerConfig, load_stage_config_merged
+from utils.config_loader import load_yaml_config
 from utils.distributed import init_distributed_from_env, prepare_model_for_distributed, unwrap_model, print_param_count_if_main, cleanup_distributed
 from torch.distributed.fsdp import FSDPModule
 
 def main():
     # vidtokenizer config merged with training_config.yaml (training takes priority), plus CLI overrides
-    args: VideoTokenizerConfig = load_stage_config_merged(VideoTokenizerConfig, default_config_path=os.path.join(os.getcwd(), 'configs', 'video_tokenizer.yaml'))
+    args = load_yaml_config(default_path=os.path.join(os.getcwd(), 'configs', 'video_tokenizer.yaml'), stage=True)
 
     # DDP setup
     dist_setup = init_distributed_from_env()
@@ -66,13 +66,14 @@ def main():
 
     # optional DDP, compile, param count, tf32
     print_param_count_if_main(model, "VideoTokenizer", is_main)
-    if args.compile:
-        model = torch.compile(model, mode="reduce-overhead", fullgraph=False, dynamic=True)
     model = prepare_model_for_distributed(
         model, 
         args.distributed, 
         device_mesh=dist_setup['device_mesh'],
     )
+    fsdp_model = model if isinstance(model, FSDPModule) else None
+    if args.compile:
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=False, dynamic=True)
     if args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -93,8 +94,8 @@ def main():
         update_loss = torch.zeros((), device=args.device)
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
-        if isinstance(model, FSDPModule):
-            model.set_requires_gradient_sync(False)
+        if fsdp_model is not None:
+            fsdp_model.set_requires_gradient_sync(False)
         if args.compile:
             torch.compiler.cudagraph_mark_step_begin()
         for micro_batch in range(args.gradient_accumulation_steps):
@@ -109,8 +110,8 @@ def main():
             with train_ctx:
                 loss, x_hat = model(x)
                 loss /= args.gradient_accumulation_steps
-                if isinstance(model, FSDPModule) and micro_batch + 1 == args.gradient_accumulation_steps:
-                    model.set_requires_gradient_sync(True)
+                if fsdp_model is not None and micro_batch + 1 == args.gradient_accumulation_steps:
+                    fsdp_model.set_requires_gradient_sync(True)
 
                 update_loss += loss.detach()
                 loss.backward()
